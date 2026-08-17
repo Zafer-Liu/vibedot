@@ -26,6 +26,17 @@
 - 底部：服务器已运行时间
 - **隐私**：不采集不显示具体执行内容（命令/文件/prompt 均不展示）
 
+## 固件烧录（首次 / 升级）
+
+预编译固件在 [`firmware/vibedot_firmware.bin`](firmware/)（合并镜像，从 `0x0` 整片写入）：
+
+```bash
+pip install esptool
+esptool.py --chip esp32c3 write_flash 0x0 firmware/vibedot_firmware.bin
+```
+
+详见 [firmware/README.md](firmware/README.md)。烧录仅首次需要，之后全靠蓝牙推送。
+
 ## 快速开始
 
 ### 1. 启动服务器
