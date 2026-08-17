@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+
+# IDE / Agent 本地配置
+.claude/
+
+# 本地构建产物与静态资源
+web/
+build/
+
+# 日志与临时文件
+*.log
+*.tmp
