@@ -1,6 +1,6 @@
 # VibeDot — 水墨屏 AI Agent 状态仪表盘
 
-把「思维重置 Quote/0」水墨屏摆件（ESP32-C3 + 2.9" 电子纸 296×152）改造成
+把Adventure X水墨屏摆件（ESP32-C3 + 2.9" 电子纸 296×152）改造成
 **蓝牙无线推送**的多 AI agent 状态仪表盘：随时看到哪个 agent 正在运行、
 是否等待审批、运行了多久——无需盯着屏幕，瞄一眼桌面即可。
 
@@ -14,6 +14,15 @@
 +--------------------------------------+
 | vibedot                  已运行 2m01s |
 +--------------------------------------+
+```
+
+```
+<img width="473" height="244" alt="image" src="https://github.com/user-attachments/assets/02ef444c-1b0f-492f-9d48-8ec12b455b5f" />
+```
+
+```
+<img width="3019" height="2149" alt="_cgi-bin_mmwebwx-bin_webwxgetmsgimg__ MsgID=2618494447812828442 skey=@crypt_f63208e2_b0016462b473feb89f5a3eb6e35a9493 mmweb_appid=wx_webfilehelper" src="https://github.com/user-attachments/assets/f9fff0b7-e8d6-4dfe-a0b9-096f63ed2bdb" />
+
 ```
 
 - 顶部横幅：正常显示 `AGENTS ×N 运行中`；某个 agent **需要审批**或**运行失败**时
