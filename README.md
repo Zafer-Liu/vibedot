@@ -35,6 +35,12 @@
 
 ### 1. 启动服务器
 
+**Windows**：双击 `start.bat`（可带监控项目路径：`start.bat D:\code\myapp`）
+**macOS / Linux**：双击 `start.command`（首次需 `chmod +x start.command`，
+也可 `./start.command /path/to/project`）
+
+脚本会自动打开浏览器控制台；或手动启动：
+
 ```powershell
 python pc\vibedot_server.py --project D:\code\myapp
 ```
