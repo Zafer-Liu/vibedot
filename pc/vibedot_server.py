@@ -300,32 +300,177 @@ def render_state():
 
 
 _pending_push_full = False   # 推送排队: pushing 期间的请求完成后补推
+_persist_ser = None         # 常驻串口: 反复开关 COM3 会触发 DTR/RTS 跳变复位 ESP32
+                            # (CDC 重枚举 -> 写超时), 打开一次常驻复用
+_ser_keep = True            # 串口常驻守护开关 (烧录期间置 False, 避免与 esptool 抢端口)
+
+
+def _get_serial():
+    """获取常驻串口 (失败/设备断开返回 None); 常驻复用, 不 close。
+    关键: dtr/rts 保持低电平——板载自动复位电路由 DTR/RTS 上升沿触发,
+    pyserial open 默认拉高两者会复位 ESP32 (CDC 重枚举 -> 写失败 ERROR_NOT_SUPPORTED,
+    且复位同时杀掉已建立的 BLE 连接)"""
+    global _persist_ser
+    import serial
+    if not _ser_keep:                    # 烧录窗口: 不与 esptool 抢端口
+        return None
+    if _persist_ser is not None and _persist_ser.is_open:
+        return _persist_ser
+    port = None
+    try:
+        from serial.tools import list_ports
+        for p in list_ports.comports():
+            if p.vid == 0x303A:          # ESP32 原生 USB
+                port = p.device
+                break
+    except Exception:
+        return None
+    if port is None:
+        return None                      # 端口未连接 -> 立刻回退蓝牙
+    try:
+        _persist_ser = serial.Serial(None, 115200, timeout=0.5, write_timeout=3)
+        _persist_ser.port = port
+        _persist_ser.dtr = False         # 不拉高 DTR/RTS, 不产生复位脉冲
+        _persist_ser.rts = False
+        _persist_ser.open()
+        print(f"[ser] open {port} handle={_persist_ser._port_handle} "
+              f"t={time.strftime('%H:%M:%S')}")
+        time.sleep(0.3)                  # 打开后稍候 (设备侧 CDC 就绪)
+        return _persist_ser
+    except Exception as e:
+        print(f"[push] 串口打开失败 {port}:", e)
+        _persist_ser = None
+        return None
+
+
+def _release_serial(force=False):
+    """释放常驻串口。
+    ESP32-C3 的 USB-Serial-JTAG 外设在主机关闭活句柄时会复位芯片, 复位后
+    USB 不再枚举 (应用照跑但 USB 死) 直到下一次深睡循环——写失败后盲目
+    close 会形成 "写失败->close->复位->USB死->睡眠" 恶性循环。
+    因此默认仅当端口确认消失 (设备已睡/拔出, list_ports 找不到 ESP32)
+    才 close; 此时句柄已死, close 安全。force=True (烧录前/主动恢复)
+    无条件 close。"""
+    global _persist_ser
+    if _persist_ser is None:
+        return
+    if not force:
+        try:
+            from serial.tools import list_ports
+            if any(p.vid == 0x303A for p in list_ports.comports()):
+                print("[ser] 端口仍在, 保持句柄不 close (close 会复位芯片)")
+                return
+        except Exception:
+            pass
+    try:
+        _persist_ser.close()
+    except Exception:
+        pass
+    _persist_ser = None
+
+
+async def _serial_keeper():
+    """串口常驻守护: 服务器存活期间始终持有 COM 口打开句柄。
+    持句柄 -> USB 链路活跃 (SOF 持续) -> 设备端 Serial.isPlugged() 为真
+    -> 固件保持常开不入睡; 无句柄时 Windows 会挂起 USB 链路, 设备端
+    误判"未插线"而进入深睡循环 (COM3 消失/写超时的根源)。
+    同时周期性排空 RX 缓冲: 只读不排空会让设备端 TX 反压卡住 loop。"""
+    global _persist_ser
+    while True:
+        if _ser_keep and not hub.pushing:
+            ser = _get_serial()
+            if ser is not None:
+                try:
+                    n = ser.in_waiting
+                    if n:
+                        txt = ser.read(n).decode("utf-8", errors="replace")
+                        for line in txt.splitlines():
+                            line = line.strip()
+                            if line:
+                                print("[dev]", line)
+                except Exception as e:
+                    print("[ser] keeper 读异常:", e)
+                    _release_serial()
+        await asyncio.sleep(2)
+
+
+def _push_serial_sync(data, fast=False):
+    """USB 串口直推 (在线程中运行, 阻塞 IO); 无 ESP32 端口/失败返回 False
+    (调用方立刻回退蓝牙)——端口检测用 VID 0x303A, 与 /api/ports 一致;
+    设备 USB-CDC 偶发抖动, 失败后换新句柄重试一轮再回退"""
+    for attempt in range(2):
+        ser = _get_serial()
+        if ser is None:
+            return False                     # 端口未连接 -> 立刻回退蓝牙
+        try:
+            ser.reset_input_buffer()
+            print(f"[ser] write 0x07 handle={ser._port_handle} "
+                  f"t={time.strftime('%H:%M:%S')}")
+            ser.write(b"\x07")               # 常开: 设备保持清醒, 串口推送长期可用
+            ser.write(b"\x00")               # 复位帧接收计数
+            for i in range(0, len(data), 128):   # 128B/块: ESP32 串口 RX 缓冲 256B
+                ser.write(b"\x02" + len(data[i:i + 128]).to_bytes(2, "little")
+                          + data[i:i + 128])
+                time.sleep(0.01)             # 消化间隙 (115200 下 128B ≈ 11ms)
+            ser.write(b"\x03" if not fast else b"\x04")
+            # 等固件刷屏完成日志 ([EPD] FULL/FAST refresh ...)
+            deadline = time.time() + 18
+            buf = b""
+            while time.time() < deadline:
+                try:
+                    chunk = ser.read(256)
+                except Exception:
+                    break
+                if chunk:
+                    buf += chunk
+                    if b"refresh " in buf:
+                        print(f"[push] 串口刷屏完成 ({ser.port}, {'快' if fast else '全'})")
+                        return True
+            print(f"[push] 串口未确认刷屏完成(第{attempt + 1}轮), 回退蓝牙")
+            return False
+        except Exception as e:
+            print(f"[push] 串口推送异常(第{attempt + 1}轮):", e)
+            # 端口仍在 (唤醒交接窗/驱动抖动) 时不 close: close 活句柄会复位
+            # 芯片致 USB 死; 仅端口真消失 (设备已睡) 才释放死句柄
+            _release_serial()
+            time.sleep(1.0)                  # 覆盖唤醒交接窗 1-3s, 提高第 2 轮命中率
+    return False
 
 
 async def do_push(force_full=False):
+    """刷屏: 优先 USB 串口直推 (快且不受 BLE 栈影响), 端口未连接立刻回退蓝牙;
+    返回 'queued' 表示 pushing 期间的全刷请求已排队 (完成后补推)"""
     global _pending_push_full
     if hub.pushing:
         if force_full:
             _pending_push_full = True   # 等当前推送完成后补一次全刷
-        return
+            return "queued"
+        return "busy"
     hub.pushing = True
     t0 = time.time()
+    path = "?"
     try:
         img = render_state()
         img.save(PREVIEW_PNG)
         data = vp.image_to_1bpp_bytes(img)
         hub.push_count += 1
         fast = not force_full and hub.push_count % FULL_REFRESH_EVERY != 0
-        # 超时保险: Windows BLE 栈偶尔永久挂起, 不能卡死调度器;
-        # 互斥锁: 与连接守护串行, 避免并发扫描互相取消 (0x800704C7)
-        async with _ble_lock:
-            ok = await asyncio.wait_for(push_cached(data, fast=fast), timeout=120)
+        # 1) 串口直推 (阻塞 IO 放线程池, 20s 上限)
+        ok = await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(
+                None, _push_serial_sync, data, fast), timeout=20)
+        path = "串口" if ok else "蓝牙"
+        if not ok:
+            # 2) 蓝牙推送: 互斥锁与连接守护串行, 避免并发扫描互相取消 (0x800704C7);
+            #    超时保险: Windows BLE 栈偶尔永久挂起, 不能卡死调度器
+            async with _ble_lock:
+                ok = await asyncio.wait_for(push_cached(data, fast=fast), timeout=120)
         if ok:
             hub.last_push = time.time()
             hub.push_eligible_at = None
-            print(f"[push] 耗时 {time.time() - t0:.1f}s")
+            print(f"[push] 耗时 {time.time() - t0:.1f}s ({path})")
     except asyncio.TimeoutError:
-        print("[push] 超时 (BLE 挂起, 已强制中断, 下轮重试)")
+        print("[push] 超时 (已强制中断, 下轮重试)")
     except Exception as e:
         print("[push] error:", e)
     finally:
@@ -333,6 +478,7 @@ async def do_push(force_full=False):
         if _pending_push_full:
             _pending_push_full = False
             asyncio.create_task(do_push(force_full=True))
+    return None
 
 
 _persist_client = None       # 常驻 BLE 连接: 推送复用免重连 (延迟 ~2s 而非 ~8s)
@@ -341,13 +487,23 @@ _last_bthserv_restart = 0.0  # 蓝牙服务重启节流 (WinRT 缓存损坏时�
 
 
 def _restart_bthserv():
-    """WinRT 缓存损坏 (怪地址/not found) 时重启蓝牙服务清缓存;
+    """WinRT 缓存损坏 (怪地址/not found) 时清理:
+    1) 删除系统配对条目——Windows 系统面板会自动重连 VibeDot,
+       反复污染 WinRT 缓存; 2) 重启蓝牙服务清缓存;
     服务器进程为管理员时有效, 失败则依赖扫描重试慢慢恢复"""
     global _last_bthserv_restart
     now = time.time()
     if now - _last_bthserv_restart < 300:      # 5 分钟最多一次
         return False
     _last_bthserv_restart = now
+    try:
+        subprocess.run(
+            ["reg", "delete",
+             r"HKLM\SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Devices\7ce8b17a3dc2",
+             "/f"], timeout=15, capture_output=True)
+        print("[ble] 系统配对条目已清理")
+    except Exception as e:
+        print("[ble] 配对条目清理失败:", e)
     try:
         subprocess.run(
             ["powershell", "-Command", "Restart-Service bthserv -Force"],
@@ -493,15 +649,16 @@ async def _write_frame(client, data, fast=False):
 
 _last_tick_push = 0.0
 _last_hold_attempt = 0.0
+_last_hold_ok = True
 _hold_task = None
 _ble_lock = asyncio.Lock()   # BLE 操作互斥: 推送/守护/扫描串行, 避免 Windows 栈冲突
 
 
 async def _auto_hold():
     """连接守护: 复用/建立常驻连接写 0x07 常开; 设备在睡眠循环时
-    扫描等到广播窗口重连; 每 5 分钟 keepalive 一次(设备断连 10 分钟才入睡,
-    常驻连接存在时设备根本不睡, 电脑开机期间设备永不睡)"""
-    global _last_hold_attempt, _hold_task
+    扫描等到广播窗口重连; 成功后每 5 分钟 keepalive 一次(设备断连 10 分钟才入睡,
+    常驻连接存在时设备根本不睡, 电脑开机期间设备永不睡); 失败则 90s 快重试"""
+    global _last_hold_attempt, _last_hold_ok, _hold_task
     import bleak
     try:
         async with _ble_lock:
@@ -526,12 +683,20 @@ async def _auto_hold():
             if client:
                 rx = client.services.get_characteristic(vp.CHAR_RX_UUID)
                 await client.write_gatt_char(rx, b"\x07", response=True)
+                _last_hold_ok = True
                 print(f"[hold] 设备常开保持 {hub.last_addr}")
             else:
+                _last_hold_ok = False
                 print("[hold] 本次未发现设备 (睡眠循环中, 下次再试)")
     except Exception as e:
+        _last_hold_ok = False
         print("[hold] 连接守护失败:", e)
         _drop_client()
+        err = str(e)
+        if "invalid literal" in err or "was not found" in err:
+            # WinRT 设备缓存损坏: 重启蓝牙服务清缓存 (怪地址/not found)
+            _restart_bthserv()
+            await asyncio.sleep(3)
     finally:
         _last_hold_attempt = time.time()
         _hold_task = None
@@ -550,15 +715,16 @@ async def scheduler():
               and time.time() - max(_last_tick_push, hub.last_push) >= TICK_INTERVAL):
             await do_push()      # agent 运行中: 每 3s 快刷更新时长; 全部结束后懒加载
             _last_tick_push = time.time()
-        # 连接守护: 无地址每 90s 尝试重连; 有地址每 300s keepalive 保持常开
+        # 连接守护: 失败/无地址每 90s 快重试; 已成功常开则每 300s keepalive
         if _hold_task is None and time.time() - _last_hold_attempt > (
-                90 if hub.last_addr is None else 300):
+                90 if (hub.last_addr is None or not _last_hold_ok) else 300):
             _hold_task = asyncio.create_task(_auto_hold())
 
 
 @app.on_event("startup")
 async def _start():
     asyncio.create_task(scheduler())
+    asyncio.create_task(_serial_keeper())
 
 
 # ---------------- API ----------------
@@ -582,8 +748,8 @@ async def api_status():
 
 @app.post("/api/push")
 async def api_push(full: int = 0):
-    await do_push(force_full=bool(full))
-    return {"ok": True, "preview": "/preview.png"}
+    r = await do_push(force_full=bool(full))
+    return {"ok": True, "queued": r == "queued", "preview": "/preview.png"}
 
 
 @app.get("/preview.png")
@@ -764,10 +930,38 @@ async def api_ports():
     return {"ports": ports, "cli": os.path.exists(ARDUINO_CLI)}
 
 
+@app.post("/api/usb-restart")
+async def api_usb_restart():
+    """强制 USB 重新枚举 (需管理员): 串口写路径卡死时恢复——
+    usbser.sys 残留挂起的写 IRP, 芯片复位不会断开 USB 链路, 驱动状态不会自行恢复"""
+    _release_serial(force=True)  # 用户主动恢复: 强制释放句柄再重启设备节点
+    ps = (r"Get-PnpDevice -InstanceId 'USB\VID_303A*' -ErrorAction SilentlyContinue"
+          r" | Where-Object { $_.Class -eq 'USB' }"
+          r" | ForEach-Object { pnputil /restart-device $_.InstanceId }")
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                           timeout=60, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace")
+        out = (r.stdout or "") + (r.stderr or "")
+        return {"ok": r.returncode == 0, "out": out[-500:]}
+    except Exception as e:
+        return {"ok": False, "out": str(e)}
+
+
 FLASH_STATE = {"running": False, "log": [], "ok": None, "port": "", "started": 0.0}
 
 
 def _flash_worker(port: str):
+    global _ser_keep
+    _ser_keep = False      # 烧录窗口: 守护/推送不再触碰串口
+    _release_serial(force=True)  # 烧录需独占串口, 无条件释放常驻句柄
+    try:
+        return _flash_worker_inner(port)
+    finally:
+        _ser_keep = True   # 烧录结束, 恢复常驻守护
+
+
+def _flash_worker_inner(port: str):
     env = dict(os.environ)
     env["ARDUINO_DIRECTORIES_DATA"] = r"E:\Tool\Arduino15"
     env["ARDUINO_DIRECTORIES_DOWNLOADS"] = r"E:\Tool\Arduino15\staging"
