@@ -1024,15 +1024,16 @@ async def _minimax_watcher():
                             _mm_offsets[path] = fh.tell()
                     except Exception:
                         continue
-                    sess_dir = os.path.dirname(path)
-                    sid = _mm_session_id(sess_dir)
+                    # MiniMax Code 是多 agent 架构 (mavis/worker/explore/verifier
+                    # 各有独立会话文件), 按会话分会上报会把 agent 列表刷爆。
+                    # 统一归并为单一 "MiniMax" agent: 一个应用在干活 = 一张卡片
                     for line in new.splitlines():
                         r = _mm_classify(line)
                         if r:
                             state, summary = r
                             hub.on_event({"type": state, "tool": "",
                                           "summary": summary, "input": {},
-                                          "session_id": sid, "cwd": "",
+                                          "session_id": "minimax", "cwd": "",
                                           "src": "minimax"})
                 # 回收过期 offset 防泄漏
                 if len(_mm_offsets) > 64:
