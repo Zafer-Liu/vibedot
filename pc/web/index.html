@@ -114,9 +114,17 @@
       <div class="trow"><input type="checkbox" id="t-qoder" checked>
         Qoder（hooks）</div>
       <span class="tstatus st-no" id="s-qoder"></span>
+      <div class="trow"><input type="checkbox" id="t-kimi" checked>
+        Kimi Code CLI（hooks）</div>
+      <span class="tstatus st-no" id="s-kimi"></span>
       <div>
         <button id="btn-setup" onclick="setupAll()"><span class="spin"></span>setup all — 接入勾选项</button>
         <button class="ghost" onclick="refreshHookStatus()">检测</button>
+      </div>
+      <div style="color:var(--dim);font-size:12px;margin-top:6px">
+        MiniMax Code 桌面版暂无公开 hooks 机制：在 Claude Code 里使用 MiniMax
+        模型时已由上方 Claude hook 覆盖；任意其他工具可用
+        <code>python vibedot_event.py coding "描述" 会话id minimax</code> 手动上报
       </div>
       <div id="log"></div>
     </div>

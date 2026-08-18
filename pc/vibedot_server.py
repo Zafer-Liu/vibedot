@@ -151,7 +151,8 @@ class Hub:
         # 只显示工具名, 不带 session 后缀 (数字/短 id 后缀无意义且难看)
         src = ev.get("src") or ""
         return {"claude": "Claude", "codex": "Codex", "workbuddy": "WorkBuddy",
-                "qoder": "Qoder"}.get(src.lower(), src or "Agent")
+                "qoder": "Qoder", "kimi": "Kimi", "minimax": "MiniMax"
+                }.get(src.lower(), src or "Agent")
 
     def on_event(self, ev):
         key = ev.get("session_id") or "default"
@@ -1087,12 +1088,43 @@ def _install_codex():
     return True, f"Codex notify 已追加到 {path}"
 
 
+def _install_kimi():
+    """Kimi Code CLI: ~/.kimi-code/config.toml (或 ~/.kimi/config.toml) 追加
+    [[hooks]] 块。Kimi 的 hook 事件与 Claude Code 同构 (stdin JSON 含
+    hook_event_name/session_id/tool_name), hook_event.py kimi 直接复用。
+    [[hooks]] 仅允许 event/matcher/command/timeout 四字段"""
+    path = os.path.expanduser("~/.kimi-code/config.toml")
+    if not os.path.isdir(os.path.expanduser("~/.kimi-code")) \
+            and os.path.isdir(os.path.expanduser("~/.kimi")):
+        path = os.path.expanduser("~/.kimi/config.toml")   # 旧版/社区版路径
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    body = open(path, encoding="utf-8").read() if os.path.exists(path) else ""
+    if "hook_event.py" in body:
+        return True, f"Kimi hooks 已存在 {path}"
+    if os.path.exists(path):
+        shutil.copy2(path, path + ".bak")
+    py = sys.executable.replace("\\", "/")
+    script = os.path.join(BASE, "hook_event.py").replace("\\", "/")
+    # TOML 单引号字面量, 内部双引号无需转义; 不写 matcher = 匹配全部
+    cmd = f"'\"{py}\" \"{script}\" kimi'"
+    events = ["UserPromptSubmit", "PreToolUse", "PostToolUse",
+              "PostToolUseFailure", "PermissionRequest", "Notification",
+              "SessionStart", "SessionEnd", "Stop"]
+    body += "\n# --- vibedot hooks (自动生成, 勿改动字段) ---\n"
+    for evt in events:
+        body += (f'[[hooks]]\nevent = "{evt}"\n'
+                 f"command = {cmd}\ntimeout = 5\n\n")
+    open(path, "w", encoding="utf-8").write(body)
+    return True, f"Kimi hooks 已写入 {path} (+{len(events)} 事件)"
+
+
 INSTALLERS = {
     "claude_user": lambda req: _install_claude("user", req.project_dir),
     "claude_project": lambda req: _install_claude("project", req.project_dir),
     "codex_desktop": lambda req: _install_codex(),
     "workbuddy": lambda req: _install_workbuddy(),
     "qoder": lambda req: _install_qoder(),
+    "kimi": lambda req: _install_kimi(),
 }
 
 
@@ -1143,6 +1175,15 @@ async def api_hook_status():
         "path": codex_path,
         "installed": os.path.exists(codex_path) and
                      "hook_event.py" in open(codex_path, encoding="utf-8").read(),
+    }
+    kimi_path = os.path.expanduser("~/.kimi-code/config.toml")
+    if not os.path.exists(kimi_path) \
+            and os.path.exists(os.path.expanduser("~/.kimi/config.toml")):
+        kimi_path = os.path.expanduser("~/.kimi/config.toml")
+    out["kimi"] = {
+        "path": kimi_path,
+        "installed": os.path.exists(kimi_path) and
+                     "hook_event.py" in open(kimi_path, encoding="utf-8").read(),
     }
     return out
 
