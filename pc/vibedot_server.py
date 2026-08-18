@@ -959,6 +959,7 @@ async def _start():
 MINIMAX_SESS = os.path.expanduser("~/.minimax/v2/sessions")
 _mm_offsets = {}        # messages.jsonl 绝对路径 -> 已读偏移
 _mm_sid_cache = {}      # 会话目录 -> sessionId (manifest.json)
+_mm_last_event = 0.0    # 最近一次 MiniMax 消息时刻 (静止超时判据)
 
 
 def _mm_session_id(sess_dir):
@@ -1031,10 +1032,21 @@ async def _minimax_watcher():
                         r = _mm_classify(line)
                         if r:
                             state, summary = r
+                            _mm_last_event = time.time()
                             hub.on_event({"type": state, "tool": "",
                                           "summary": summary, "input": {},
                                           "session_id": "minimax", "cwd": "",
                                           "src": "minimax"})
+                # 静止超时: 卡片活跃但 90s 无任何新消息 = 回合结束/应用关闭
+                # (应用关闭后不再有消息流, 主动发 done 而不是等 10min 兜底)
+                mm = hub.agents.get("minimax")
+                if mm and mm.state in ACTIVE_STATES \
+                        and _mm_last_event and time.time() - _mm_last_event > 90:
+                    print("[minimax] 90s 无新消息 -> done")
+                    hub.on_event({"type": "done", "tool": "", "summary": "",
+                                  "input": {}, "session_id": "minimax",
+                                  "cwd": "", "src": "minimax"})
+                    _mm_last_event = 0.0
                 # 回收过期 offset 防泄漏
                 if len(_mm_offsets) > 64:
                     live = set(files)
