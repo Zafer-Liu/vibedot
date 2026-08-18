@@ -122,8 +122,9 @@
         <button class="ghost" onclick="refreshHookStatus()">检测</button>
       </div>
       <div style="color:var(--dim);font-size:12px;margin-top:6px">
-        MiniMax Code 桌面版暂无公开 hooks 机制：在 Claude Code 里使用 MiniMax
-        模型时已由上方 Claude hook 覆盖；任意其他工具可用
+        MiniMax Code 无公开 hooks → 服务器已启用<b>会话文件监视器</b>（自动 tail
+        ~/.minimax 会话流,无需配置）；在 Claude Code 里跑 MiniMax 模型则由上方
+        Claude hook 覆盖；其他任意工具可用
         <code>python vibedot_event.py coding "描述" 会话id minimax</code> 手动上报
       </div>
       <div id="log"></div>

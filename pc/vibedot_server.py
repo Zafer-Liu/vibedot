@@ -948,6 +948,103 @@ async def _start():
     hub.push_eligible_at = time.time() + 8
     asyncio.create_task(scheduler())
     asyncio.create_task(_serial_keeper())
+    asyncio.create_task(_minimax_watcher())
+
+
+# ---------------- MiniMax Code 会话文件监视器 ----------------
+# MiniMax Code 桌面版无原生 hooks (Electron 闭源, config.yaml 仅模型配置),
+# 但完整会话流实时落盘: ~/.minimax/v2/sessions/**/messages.jsonl
+#   每行 {"message_id","turn_id","message":{"role","content":[...]}}
+# watcher tail 这些文件 -> 归一化上报状态机 (src=minimax), hook 等价物
+MINIMAX_SESS = os.path.expanduser("~/.minimax/v2/sessions")
+_mm_offsets = {}        # messages.jsonl 绝对路径 -> 已读偏移
+_mm_sid_cache = {}      # 会话目录 -> sessionId (manifest.json)
+
+
+def _mm_session_id(sess_dir):
+    if sess_dir not in _mm_sid_cache:
+        try:
+            m = json.load(open(os.path.join(sess_dir, "manifest.json"),
+                               encoding="utf-8"))
+            _mm_sid_cache[sess_dir] = m.get("sessionId") or os.path.basename(sess_dir)
+        except Exception:
+            _mm_sid_cache[sess_dir] = "minimax-" + os.path.basename(sess_dir)[-12:]
+    return _mm_sid_cache[sess_dir]
+
+
+def _mm_classify(line):
+    """一行 messages.jsonl -> (state, summary) 或 None"""
+    try:
+        obj = json.loads(line)
+    except Exception:
+        return None
+    msg = obj.get("message") or {}
+    role = msg.get("role", "")
+    if role not in ("user", "assistant"):
+        return None
+    text = ""
+    for part in (msg.get("content") or []):
+        if isinstance(part, dict) and part.get("type") == "text":
+            text = (part.get("text") or "").strip()
+            break
+    if role == "user":
+        # 系统注入的上下文 (system-reminder 等) 不算用户活动
+        if text.startswith("<system-reminder>") or text.startswith("<"):
+            return None
+        return "thinking", text[:40]
+    # assistant 消息 = 模型在产出 (编码/回答中)
+    return "coding", text[:40]
+
+
+async def _minimax_watcher():
+    """每 2s 扫描 MiniMax 会话目录, tail 最近活跃的 messages.jsonl。
+    目录不存在 (未安装 MiniMax Code) 时静默待机。"""
+    import glob as _glob
+    while True:
+        try:
+            files = _glob.glob(os.path.join(
+                MINIMAX_SESS, "**", "messages.jsonl"), recursive=True)
+            if files:
+                # 只跟踪最近 1 小时内有写入的会话文件 (活跃窗口)
+                now = time.time()
+                files = [f for f in files
+                         if now - os.path.getmtime(f) < 3600]
+                files.sort(key=os.path.getmtime, reverse=True)
+                for path in files[:8]:
+                    off = _mm_offsets.get(path, 0)
+                    try:
+                        sz = os.path.getsize(path)
+                        if sz < off:            # 文件被截断/轮转
+                            off = 0
+                        if sz == off:
+                            continue
+                        with open(path, encoding="utf-8", errors="ignore") as fh:
+                            fh.seek(off)
+                            new = fh.read()
+                            _mm_offsets[path] = fh.tell()
+                    except Exception:
+                        continue
+                    sess_dir = os.path.dirname(path)
+                    sid = _mm_session_id(sess_dir)
+                    for line in new.splitlines():
+                        r = _mm_classify(line)
+                        if r:
+                            state, summary = r
+                            hub.on_event({"type": state, "tool": "",
+                                          "summary": summary, "input": {},
+                                          "session_id": sid, "cwd": "",
+                                          "src": "minimax"})
+                # 回收过期 offset 防泄漏
+                if len(_mm_offsets) > 64:
+                    live = set(files)
+                    for k in list(_mm_offsets):
+                        if k not in live:
+                            _mm_offsets.pop(k, None)
+        except FileNotFoundError:
+            pass                       # 未安装 MiniMax Code: 静默
+        except Exception as e:
+            print("[minimax] watcher 异常:", e)
+        await asyncio.sleep(2)
 
 
 # ---------------- API ----------------
@@ -1184,6 +1281,11 @@ async def api_hook_status():
         "path": kimi_path,
         "installed": os.path.exists(kimi_path) and
                      "hook_event.py" in open(kimi_path, encoding="utf-8").read(),
+    }
+    out["minimax"] = {
+        "path": MINIMAX_SESS,
+        # MiniMax Code 无 hooks: 文件监视器随服务器自动运行, 装了就生效
+        "installed": os.path.isdir(MINIMAX_SESS),
     }
     return out
 
