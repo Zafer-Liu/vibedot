@@ -64,8 +64,21 @@ TOOL_CLASS = {
 
 MIN_PUSH_INTERVAL = 3        # 常规状态最小刷屏间隔 (hook 事件后 ~3s 内上屏)
 IMMEDIATE_MIN_INTERVAL = 2   # 立即状态最小间隔
-TICK_INTERVAL = 3            # 活跃期间周期重刷: 有 agent 运行每 3s 一次; 无活跃时懒加载(事件驱动)
-FULL_REFRESH_EVERY = 8       # 每 N 次快刷插一次全刷清残影
+TICK_INTERVAL = 15           # 活跃期间周期重刷: 检测到对话 (agent 活跃) 每 15s
+                             # 蓝牙快刷更新状态; 3s 节拍下每 ~25s 就要一次全刷
+                             # (大电流, 供电边际设备会弹跳), 15s + 对齐的全刷
+                             # 间隔把全刷降到 ~4 分钟一次
+FULL_REFRESH_EVERY = int(os.environ.get("VIBEDOT_FULL_EVERY", 1))
+                             # 全刷/快刷比例: N 次里 1 次全刷。默认 1 = 全部
+                             # 全刷 (最稳: 对 VCOM 丢失免疫, 设备复位后依然
+                             # 正常刷新; 代价 1.4s 黑白闪烁)。烧录 v8 固件后
+                             # 可改回 16 恢复无闪烁快刷 (15s 节拍下 4 分钟
+                             # 一次全刷清残影)
+IDLE_HEARTBEAT = 600         # 空闲心跳: 无 agent 活跃时每 10 分钟仍刷一次,
+                             # 让顶栏时钟走字/状态不过夜 (否则懒加载下时钟
+                             # 冻结在最后一次推送, 早上看像"坏了")
+SERIAL_PUSH_TIMEOUT = 25     # 串口推送硬上限 (超时 = usbser 写 IRP 挂起: 冷却串口并立刻回退蓝牙)
+BLE_PUSH_TIMEOUT = 120       # 蓝牙推送硬上限 (含等锁时间: 连接守护卡死时推送不被无限阻塞)
 
 
 class Agent:
@@ -99,6 +112,8 @@ class Hub:
         self.push_count = 0
         self.last_addr = None
         self.pushing = False
+        self.last_push_result = None          # 最近一次推送结果 {ok,path,dur,ts}
+        self.push_fail_streak = 0             # 连续推送失败次数 (离线退避用)
 
     # ---- 事件分类 (hook 事件或直接状态; Claude Code / Qoder / WorkBuddy 同构) ----
     # 注: 不采集具体执行内容 (命令/文件/prompt), 只用状态与工具名
@@ -193,10 +208,16 @@ class Hub:
         return "idle"
 
     def reap_idle(self):
-        """回收: waiting/error 卡住 2 分钟自动解除; done/结束 60s 无新事件移除
-        (避免"已结束还一直显示运行"); ACTIVE 状态 15 分钟无事件视为僵尸移除
-        (agent 异常退出后 hook 不再发事件, 不能永远显示运行)"""
+        """回收与状态兜底:
+        - waiting/error 卡住 2 分钟自动解除
+        - ACTIVE 状态超时无事件 -> 先降级为 done (对话结束但平台没发 Stop/
+          SessionEnd 事件时, 屏幕不能永远显示"思考中"; hook 事件覆盖不全的
+          服务端兜底), 降级后 60s 无新事件再移除
+        - 僵尸 agent 15 分钟无事件移除 (agent 异常退出后 hook 不再发事件)"""
         now = time.time()
+        # 状态降级时限: 思考/检索 3 分钟, 编码/命令/子任务 10 分钟
+        stale_limit = {"thinking": 180, "searching": 180,
+                       "coding": 600, "command": 600, "subagent": 600}
         for key in list(self.agents):
             a = self.agents[key]
             if a.state == "waiting" and now - a.since > 120:
@@ -207,6 +228,13 @@ class Hub:
                 self.agents.pop(key, None)
                 self.push_eligible_at = now + 2
                 continue
+            lim = stale_limit.get(a.state)
+            if lim and now - a.last_seen > lim:
+                # 超时无事件: 平台漏发 Stop 的兜底, 降级 done 让屏幕显示完成
+                print(f"[hub] {a.name} {a.state} 超 {lim}s 无事件 -> done")
+                a.state = "done"
+                a.since = now
+                self.push_eligible_at = now + 2
             if a.state in ACTIVE_STATES and now - a.last_seen > 900:
                 self.agents.pop(key, None)          # 僵尸 agent: 15 分钟无事件
                 self.push_eligible_at = now + 2
@@ -254,7 +282,8 @@ def render_state():
 
     # ---- 顶部横幅 ----
     # 特殊事件: 某个 agent 需要审批 / 运行失败 (反色突出 + agent 名字)
-    # 正常: AGENTS ×N 运行中 / AGENTS 0
+    # 正常: AGENTS ×N 运行中 / AGENTS 0; 右侧秒级刷新时间戳 (快刷无闪烁,
+    # 时间戳每推必变, 肉眼可确认屏幕活着)
     banner = None
     for a in hub.agents.values():
         if a.state == "waiting":
@@ -264,14 +293,19 @@ def render_state():
             banner = f"{a.name} 运行失败"
             break
     n_active = sum(1 for a in hub.agents.values() if a.state in ACTIVE_STATES)
+    clock = time.strftime("%H:%M:%S")
     if banner:
         d.rectangle([0, 0, vp.EPD_W, 34], fill=0, outline=0)
         d.rectangle([2, 2, vp.EPD_W - 3, 32], outline=255, width=2)
         d.text((8, 6), banner, font=f_big, fill=255)
+        tw = d.textlength(clock, font=f_small)
+        d.text((vp.EPD_W - 8 - tw, 10), clock, font=f_small, fill=255)
     else:
         d.rectangle([0, 0, vp.EPD_W, 34], fill=0)
         d.text((6, 6), f"AGENTS ×{n_active} 运行中" if n_active else "AGENTS 0",
                font=f_big, fill=255)
+        tw = d.textlength(clock, font=f_small)
+        d.text((vp.EPD_W - 8 - tw, 10), clock, font=f_small, fill=255)
 
     # ---- Agent 列表 (核心区, 直到距底部 22px; 不显示具体执行内容) ----
     y = 42
@@ -299,10 +333,17 @@ def render_state():
     return img
 
 
-_pending_push_full = False   # 推送排队: pushing 期间的请求完成后补推
+_pending_push_full = False   # 推送排队: pushing 期间的全刷请求完成后补推
+_pending_push_any = False    # 推送排队: pushing 期间的普通推送请求完成后补推 (点击不丢)
 _persist_ser = None         # 常驻串口: 反复开关 COM3 会触发 DTR/RTS 跳变复位 ESP32
                             # (CDC 重枚举 -> 写超时), 打开一次常驻复用
 _ser_keep = True            # 串口常驻守护开关 (烧录期间置 False, 避免与 esptool 抢端口)
+_ser_ready_at = 0.0         # 串口就绪时刻: 设备唤醒后 esp_restart+自检 ~15s,
+                            # 过早写会撞半死窗 (超时/error 22); 收到设备横幅
+                            # ([VIBEDOT] BLE advertising) 即提前就绪
+_ser_poison_until = 0.0     # 串口冷却期: 写 IRP 挂起后一段时间内跳过串口直走蓝牙
+_ser_io_lock = threading.Lock()   # 串口 IO 互斥: keeper / 推送线程共享句柄,
+                                  # 挂起的写不与新 IO 并发 (pyserial 非线程安全)
 
 
 def _get_serial():
@@ -333,6 +374,8 @@ def _get_serial():
         _persist_ser.dtr = False         # 不拉高 DTR/RTS, 不产生复位脉冲
         _persist_ser.rts = False
         _persist_ser.open()
+        global _ser_ready_at
+        _ser_ready_at = time.time() + 30   # 观察期: 收到设备横幅即提前就绪
         print(f"[ser] open {port} handle={_persist_ser._port_handle} "
               f"t={time.strftime('%H:%M:%S')}")
         time.sleep(0.3)                  # 打开后稍候 (设备侧 CDC 就绪)
@@ -369,116 +412,222 @@ def _release_serial(force=False):
     _persist_ser = None
 
 
+def _is_dead_handle_err(e):
+    """判断异常是否表示句柄已死 (设备重枚举/拔出后旧句柄失效):
+    死句柄 close 安全 (不会复位芯片); 活句柄 (超时/半死) 绝不能 close"""
+    if isinstance(e, (PermissionError, OSError)):
+        w = getattr(e, "winerror", None)
+        if w in (22, 6, 1167, 433, 995):
+            # ERROR_BAD_COMMAND / INVALID_HANDLE / DEVICE_NOT_CONNECTED
+            # / ERROR_NO_SYSTEM_RESOURCES? / ERROR_OPERATION_ABORTED
+            return True
+    return False
+
+
+def _port_gone():
+    """ESP32 串口是否已从系统消失 (写超时后判断句柄死活的旁证)"""
+    try:
+        from serial.tools import list_ports
+        return not any(p.vid == 0x303A for p in list_ports.comports())
+    except Exception:
+        return False
+
+
+def _serial_keeper_tick(heartbeat: bool):
+    """一次守护 IO (在线程池执行, 绝不在事件循环里直接碰串口):
+    排空 RX + 周期心跳 0x00。usbser 写 IRP 挂起时本函数卡在线程里,
+    事件循环照常运行; 下一轮 tick 因 _ser_io_lock 被占而自动跳过。"""
+    global _ser_ready_at
+    ser = _get_serial()
+    if ser is None:
+        return
+    if not _ser_io_lock.acquire(blocking=False):
+        return                      # 上一轮 IO 仍挂起: 跳过本轮
+    try:
+        n = ser.in_waiting
+        if n:
+            txt = ser.read(n).decode("utf-8", errors="replace")
+            for line in txt.splitlines():
+                line = line.strip()
+                if line:
+                    print("[dev]", line)
+            if ("BLE advertising" in txt or "[PWR]" in txt
+                    or "[SER] always-on" in txt):
+                # setup 完成/设备确认常开: 数据通路已通, 串口立即可推
+                _ser_ready_at = time.time() + 1
+                print("[ser] 设备就绪")
+        if heartbeat:
+            ser.write(b"\x00")     # ~6s 心跳, 保持设备端 serLastRxMs 新鲜
+    except Exception as e:
+        print("[ser] keeper 异常:", e)
+        # 句柄已死 (设备重枚举/睡) -> close 安全; 活句柄 (超时) 保守不 close
+        _release_serial(force=_is_dead_handle_err(e))
+    finally:
+        _ser_io_lock.release()
+
+
 async def _serial_keeper():
     """串口常驻守护: 服务器存活期间始终持有 COM 口打开句柄。
     持句柄 -> USB 链路活跃 (SOF 持续) -> 设备端 Serial.isPlugged() 为真
     -> 固件保持常开不入睡; 无句柄时 Windows 会挂起 USB 链路, 设备端
     误判"未插线"而进入深睡循环 (COM3 消失/写超时的根源)。
-    同时周期性排空 RX 缓冲: 只读不排空会让设备端 TX 反压卡住 loop。"""
-    global _persist_ser
+    同时周期性排空 RX 缓冲 (只读不排空会让设备端 TX 反压卡住 loop),
+    每 ~6s 写心跳 0x00: 设备以串口数据活动判定 USB 存活。
+    所有阻塞 IO 经线程池执行且带超时: 单次 IO 挂起不会冻结事件循环
+    (此前 ser.write 在事件循环内直接调用, usbser 挂起时整个服务器假死)。"""
+    tick = 0
+    loop = asyncio.get_running_loop()
     while True:
-        if _ser_keep and not hub.pushing:
-            ser = _get_serial()
-            if ser is not None:
-                try:
-                    n = ser.in_waiting
-                    if n:
-                        txt = ser.read(n).decode("utf-8", errors="replace")
-                        for line in txt.splitlines():
-                            line = line.strip()
-                            if line:
-                                print("[dev]", line)
-                except Exception as e:
-                    print("[ser] keeper 读异常:", e)
-                    _release_serial()
+        if _ser_keep and not hub.pushing and time.time() >= _ser_poison_until:
+            tick += 1
+            heartbeat = tick >= 3
+            if heartbeat:
+                tick = 0
+            try:
+                await asyncio.wait_for(
+                    loop.run_in_executor(None, _serial_keeper_tick, heartbeat),
+                    timeout=8)
+            except asyncio.TimeoutError:
+                print("[ser] keeper IO 超时 (写 IRP 挂起?), 本轮跳过")
+            except Exception as e:
+                print("[ser] keeper 调度异常:", e)
         await asyncio.sleep(2)
 
 
 def _push_serial_sync(data, fast=False):
     """USB 串口直推 (在线程中运行, 阻塞 IO); 无 ESP32 端口/失败返回 False
     (调用方立刻回退蓝牙)——端口检测用 VID 0x303A, 与 /api/ports 一致;
-    设备 USB-CDC 偶发抖动, 失败后换新句柄重试一轮再回退"""
-    for attempt in range(2):
-        ser = _get_serial()
-        if ser is None:
-            return False                     # 端口未连接 -> 立刻回退蓝牙
-        try:
-            ser.reset_input_buffer()
-            print(f"[ser] write 0x07 handle={ser._port_handle} "
-                  f"t={time.strftime('%H:%M:%S')}")
-            ser.write(b"\x07")               # 常开: 设备保持清醒, 串口推送长期可用
-            ser.write(b"\x00")               # 复位帧接收计数
-            for i in range(0, len(data), 128):   # 128B/块: ESP32 串口 RX 缓冲 256B
-                ser.write(b"\x02" + len(data[i:i + 128]).to_bytes(2, "little")
-                          + data[i:i + 128])
-                time.sleep(0.01)             # 消化间隙 (115200 下 128B ≈ 11ms)
-            ser.write(b"\x03" if not fast else b"\x04")
-            # 等固件刷屏完成日志 ([EPD] FULL/FAST refresh ...)
-            deadline = time.time() + 18
-            buf = b""
-            while time.time() < deadline:
-                try:
-                    chunk = ser.read(256)
-                except Exception:
-                    break
-                if chunk:
-                    buf += chunk
-                    if b"refresh " in buf:
-                        print(f"[push] 串口刷屏完成 ({ser.port}, {'快' if fast else '全'})")
-                        return True
-            print(f"[push] 串口未确认刷屏完成(第{attempt + 1}轮), 回退蓝牙")
-            return False
-        except Exception as e:
-            print(f"[push] 串口推送异常(第{attempt + 1}轮):", e)
-            # 端口仍在 (唤醒交接窗/驱动抖动) 时不 close: close 活句柄会复位
-            # 芯片致 USB 死; 仅端口真消失 (设备已睡) 才释放死句柄
-            _release_serial()
-            time.sleep(1.0)                  # 覆盖唤醒交接窗 1-3s, 提高第 2 轮命中率
-    return False
+    设备唤醒后 esp_restart+自检 ~15s (USB 半死窗), 就绪前直接回退蓝牙"""
+    global _ser_poison_until
+    if time.time() < _ser_poison_until:
+        return False                 # 写 IRP 挂起冷却期: 直接走蓝牙
+    if not _ser_io_lock.acquire(timeout=3):
+        print("[push] 串口 IO 忙 (先前写挂起未返回), 回退蓝牙")
+        return False
+    try:
+        for attempt in range(2):
+            ser = _get_serial()
+            if ser is None:
+                return False                     # 端口未连接 -> 立刻回退蓝牙
+            if time.time() < _ser_ready_at:
+                # 就绪检查必须在 _get_serial 之后: 新打开的句柄有自己的 30s
+                # 观察期 (设备半死窗), 先查后开会把写入打进未就绪窗口 ->
+                # 超时 -> 误关句柄 -> 复位芯片的恶性循环
+                print(f"[push] 串口未就绪 (设备唤醒自检中, {_ser_ready_at - time.time():.0f}s 后可用), 回退蓝牙")
+                return False
+            try:
+                ser.reset_input_buffer()
+                print(f"[ser] write 0x07 handle={ser._port_handle} "
+                      f"t={time.strftime('%H:%M:%S')}")
+                ser.write(b"\x07")               # 常开: 设备保持清醒, 串口推送长期可用
+                ser.write(b"\x00")               # 复位帧接收计数
+                for i in range(0, len(data), 128):   # 128B/块: ESP32 串口 RX 缓冲 256B
+                    ser.write(b"\x02" + len(data[i:i + 128]).to_bytes(2, "little")
+                              + data[i:i + 128])
+                    time.sleep(0.01)             # 消化间隙 (115200 下 128B ≈ 11ms)
+                ser.write(b"\x03" if not fast else b"\x04")
+                # 等固件刷屏完成日志 ([EPD] FULL/FAST refresh ...)
+                deadline = time.time() + 18
+                buf = b""
+                while time.time() < deadline:
+                    try:
+                        chunk = ser.read(256)
+                    except Exception:
+                        break
+                    if chunk:
+                        buf += chunk
+                        if b"refresh " in buf:
+                            print(f"[push] 串口刷屏完成 ({ser.port}, {'快' if fast else '全'})")
+                            return True
+                print(f"[push] 串口未确认刷屏完成(第{attempt + 1}轮), 回退蓝牙")
+                return False
+            except Exception as e:
+                print(f"[push] 串口推送异常(第{attempt + 1}轮):", e)
+                # 句柄已死 (设备重枚举/拔出, winerror 22/6 等) -> close 安全重开;
+                # 活句柄 (写超时/半死) 绝不能 close——close 活句柄会复位芯片,
+                # 且 list_ports 在 USB 枚举抖动时不可靠 ("端口消失"可能误报),
+                # 一旦据此强关就形成 每轮推送->复位->重枚举 的重启死循环
+                _release_serial(force=_is_dead_handle_err(e))
+                time.sleep(1.0)                  # 覆盖唤醒交接窗 1-3s, 提高第 2 轮命中率
+        return False
+    finally:
+        _ser_io_lock.release()
 
 
 async def do_push(force_full=False):
-    """刷屏: 优先 USB 串口直推 (快且不受 BLE 栈影响), 端口未连接立刻回退蓝牙;
-    返回 'queued' 表示 pushing 期间的全刷请求已排队 (完成后补推)"""
-    global _pending_push_full
+    """刷屏: 优先 USB 串口直推 (快且不受 BLE 栈影响), 端口未连接/未就绪/
+    写挂起/任何异常 都立刻回退蓝牙——串口失败绝不终止推送。
+    返回 'ok' | 'fail' | 'queued' (pushing 期间的请求排队, 完成后补推)"""
+    global _pending_push_full, _pending_push_any, _ser_poison_until
     if hub.pushing:
+        # 排队而非丢弃: 全刷排全刷, 普通推送排普通补推 (点击不丢)
         if force_full:
-            _pending_push_full = True   # 等当前推送完成后补一次全刷
-            return "queued"
-        return "busy"
+            _pending_push_full = True
+        else:
+            _pending_push_any = True
+        return "queued"
     hub.pushing = True
     t0 = time.time()
     path = "?"
+    ok = False
     try:
         img = render_state()
         img.save(PREVIEW_PNG)
         data = vp.image_to_1bpp_bytes(img)
         hub.push_count += 1
         fast = not force_full and hub.push_count % FULL_REFRESH_EVERY != 0
-        # 1) 串口直推 (阻塞 IO 放线程池, 20s 上限)
-        ok = await asyncio.wait_for(
-            asyncio.get_event_loop().run_in_executor(
-                None, _push_serial_sync, data, fast), timeout=20)
+        # 1) 串口直推 (阻塞 IO 放线程池)。任何结果 (含超时/异常) 都继续蓝牙回退,
+        #    绝不提前中断——此前串口超时直接落入外层 except, 蓝牙永远不会被尝试
+        try:
+            ok = await asyncio.wait_for(
+                asyncio.get_running_loop().run_in_executor(
+                    None, _push_serial_sync, data, fast),
+                timeout=SERIAL_PUSH_TIMEOUT)
+        except asyncio.TimeoutError:
+            # usbser 写 IRP 挂起 (close/复位都救不了, 需设备节点重启):
+            # 冷却串口 2 分钟直接走蓝牙, 避免每轮推送都白等 25s
+            _ser_poison_until = time.time() + 120
+            print(f"[push] 串口推送超时 (写 IRP 挂起?), 冷却 120s, 立即回退蓝牙")
+        except Exception as e:
+            print("[push] 串口推送异常 (回退蓝牙):", e)
         path = "串口" if ok else "蓝牙"
         if not ok:
-            # 2) 蓝牙推送: 互斥锁与连接守护串行, 避免并发扫描互相取消 (0x800704C7);
-            #    超时保险: Windows BLE 栈偶尔永久挂起, 不能卡死调度器
-            async with _ble_lock:
-                ok = await asyncio.wait_for(push_cached(data, fast=fast), timeout=120)
+            # 2) 蓝牙推送: 互斥锁与连接守护串行, 避免并发扫描互相取消 (0x800704C7)。
+            #    等锁也计入超时——守护任务持锁扫描挂起时, 推送最多等 BLE_PUSH_TIMEOUT
+            #    而不是永久卡死 (卡死时 pushing=True 会吞掉所有后续推送/点击)
+            async def _ble_push():
+                async with _ble_lock:
+                    return await push_cached(data, fast=fast)
+            try:
+                ok = await asyncio.wait_for(_ble_push(), timeout=BLE_PUSH_TIMEOUT)
+            except asyncio.TimeoutError:
+                # 常见: 常驻连接上 write 永久挂起 (WinRT)。丢弃连接, 下轮重建,
+                # 否则坏连接被反复复用 -> 表现为"蓝牙彻底失效"
+                _drop_client()
+                print("[push] 蓝牙推送超时 (已丢弃常驻连接, 下轮重建)")
+            except Exception as e:
+                print("[push] 蓝牙推送异常:", e)
+                _drop_client()
         if ok:
             hub.last_push = time.time()
             hub.push_eligible_at = None
-            print(f"[push] 耗时 {time.time() - t0:.1f}s ({path})")
-    except asyncio.TimeoutError:
-        print("[push] 超时 (已强制中断, 下轮重试)")
+            hub.push_fail_streak = 0
+        else:
+            hub.push_fail_streak += 1
+        hub.last_push_result = {"ok": bool(ok), "path": path,
+                                "dur": round(time.time() - t0, 1),
+                                "ts": time.time()}
+        print(f"[push] {'成功' if ok else '失败'} 耗时 {time.time() - t0:.1f}s ({path})")
     except Exception as e:
         print("[push] error:", e)
     finally:
         hub.pushing = False
-        if _pending_push_full:
+        if _pending_push_full or _pending_push_any:
+            full = _pending_push_full
             _pending_push_full = False
-            asyncio.create_task(do_push(force_full=True))
-    return None
+            _pending_push_any = False
+            asyncio.create_task(do_push(force_full=full))
+    return "ok" if ok else "fail"
 
 
 _persist_client = None       # 常驻 BLE 连接: 推送复用免重连 (延迟 ~2s 而非 ~8s)
@@ -487,9 +636,10 @@ _last_bthserv_restart = 0.0  # 蓝牙服务重启节流 (WinRT 缓存损坏时�
 
 
 def _restart_bthserv():
-    """WinRT 缓存损坏 (怪地址/not found) 时清理:
-    1) 删除系统配对条目——Windows 系统面板会自动重连 VibeDot,
-       反复污染 WinRT 缓存; 2) 重启蓝牙服务清缓存;
+    """WinRT 缓存污染 (怪地址/0000None/0x800704C7 已取消) 根治三步:
+    1) pnputil 解除系统配对——配对态 Windows 会自动重连 VibeDot 抢占唯一
+       BLE 连接 (写被取消) 并向缓存写脏服务数据; bleak 连接无需配对,
+       解除后固件正常工作; 2) 删 BTHPORT 残留键; 3) 重启蓝牙服务清缓存。
     服务器进程为管理员时有效, 失败则依赖扫描重试慢慢恢复"""
     global _last_bthserv_restart
     now = time.time()
@@ -497,16 +647,27 @@ def _restart_bthserv():
         return False
     _last_bthserv_restart = now
     try:
+        r = subprocess.run(
+            ["pnputil", "/remove-device",
+             r"BTHLE\DEV_7CE8B17A3DC2\7&17003C4D&0&7CE8B17A3DC2"],
+            timeout=30, capture_output=True)
+        out = (r.stdout or b"") + (r.stderr or b"")
+        ok = r.returncode == 0
+        print("[ble] 系统配对已解除" if ok
+              else "[ble] 解除配对未生效 (可能已无配对): "
+                   + out.decode("gbk", errors="replace").strip()[-80:])
+    except Exception as e:
+        print("[ble] 解除配对异常:", e)
+    try:
         subprocess.run(
             ["reg", "delete",
              r"HKLM\SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Devices\7ce8b17a3dc2",
              "/f"], timeout=15, capture_output=True)
-        print("[ble] 系统配对条目已清理")
-    except Exception as e:
-        print("[ble] 配对条目清理失败:", e)
+    except Exception:
+        pass
     try:
         subprocess.run(
-            ["powershell", "-Command", "Restart-Service bthserv -Force"],
+            ["powershell", "-NoProfile", "-Command", "Restart-Service bthserv -Force"],
             timeout=30, capture_output=True)
         print("[ble] 蓝牙服务已重启 (WinRT 缓存清空)")
         return True
@@ -538,7 +699,10 @@ async def _ensure_client():
     # 优先用扫描对象连接 (WinRT 按地址查找偶发 not found 时对象仍可连)
     if _persist_device is not None:
         try:
-            c = bleak.BleakClient(_persist_device, timeout=20.0)
+            # use_cached_services=False: 每次连接强制全新服务发现 (UNCACHED),
+            # 绕开被污染的 WinRT GATT 缓存 (0000None 解析错误); 代价 ~1s
+            c = bleak.BleakClient(_persist_device, timeout=20.0,
+                                  use_cached_services=False)
             await c.connect()
             _persist_client = c
             return c
@@ -549,7 +713,8 @@ async def _ensure_client():
         hub.last_addr = None
         return None
     try:
-        c = bleak.BleakClient(hub.last_addr, timeout=20.0)
+        c = bleak.BleakClient(hub.last_addr, timeout=20.0,
+                              use_cached_services=False)
         await c.connect()
         _persist_client = c
         return c
@@ -578,9 +743,13 @@ async def push_cached(data, fast=False):
                     print(f"[push] 直推失败(第{attempt + 1}轮):", e)
                     _drop_client()
                     if "invalid literal" in err or "was not found" in err:
-                        # WinRT 设备缓存损坏: 重启蓝牙服务清缓存后重试
-                        _restart_bthserv()
-                        await asyncio.sleep(3)
+                        # WinRT 设备缓存损坏: 重启蓝牙服务清缓存后重试。
+                        # 服务重启+缓存刷新需数秒, 等 8s 再试 (3s 会撞上
+                        # 服务未就绪, 白白多烧一轮 20s 连接超时)
+                        if _restart_bthserv():
+                            await asyncio.sleep(8)
+                        else:
+                            await asyncio.sleep(1)
                     else:
                         await asyncio.sleep(1)
             else:
@@ -591,7 +760,14 @@ async def push_cached(data, fast=False):
     global _persist_device
     tgt = None
     for _ in range(3):
-        devices = await bleak.BleakScanner.discover(timeout=30.0)
+        try:
+            devices = await bleak.BleakScanner.discover(timeout=30.0)
+        except Exception as e:
+            # 设备复位瞬间广播包是脏的 (0000None 解析失败): 等下轮干净广播,
+            # 不让单次解析失败报废整轮推送
+            print("[push] 扫描解析失败 (设备复位中?), 2s 后重扫:", e)
+            await asyncio.sleep(2)
+            continue
         tgt = next((d for d in devices
                     if d.name == "VibeDot" and _valid_mac(d.address)), None)
         if tgt:
@@ -605,8 +781,15 @@ async def push_cached(data, fast=False):
     client = await _ensure_client()
     if client is None:
         return False
-    await _write_frame(client, data, fast=fast)
-    return True
+    try:
+        # 必须兜异常: WinRT 缓存损坏时 _write_frame 内 services 解析会抛
+        # invalid literal —— 此前未捕获直接炸出 push_cached, 整轮推送报废
+        await _write_frame(client, data, fast=fast)
+        return True
+    except Exception as e:
+        print("[push] 扫描路径推送失败:", e)
+        _drop_client()
+        return False
 
 
 async def _write_frame(client, data, fast=False):
@@ -657,17 +840,35 @@ _ble_lock = asyncio.Lock()   # BLE 操作互斥: 推送/守护/扫描串行, 避
 async def _auto_hold():
     """连接守护: 复用/建立常驻连接写 0x07 常开; 设备在睡眠循环时
     扫描等到广播窗口重连; 成功后每 5 分钟 keepalive 一次(设备断连 10 分钟才入睡,
-    常驻连接存在时设备根本不睡, 电脑开机期间设备永不睡); 失败则 90s 快重试"""
+    常驻连接存在时设备根本不睡, 电脑开机期间设备永不睡); 失败则 90s 快重试。
+    推送进行中不启动 (避免抢 _ble_lock 把推送堵在门外); 每次扫描带硬超时,
+    WinRT 挂起时及时放弃本轮而不是无限持锁 (否则推送会被永久阻塞)。"""
     global _last_hold_attempt, _last_hold_ok, _hold_task
     import bleak
     try:
+        if hub.pushing:
+            return                      # 推送优先, 让出 BLE 通道
         async with _ble_lock:
+            if hub.pushing:             # 等锁期间推送可能已开始
+                return
             client = await _ensure_client()
             if client is None:
                 # 扫描等广播窗口 (55s 睡 / 20s 广播)
                 tgt = None
                 for _ in range(3):
-                    devices = await bleak.BleakScanner.discover(timeout=30.0, return_adv=True)
+                    try:
+                        devices = await asyncio.wait_for(
+                            bleak.BleakScanner.discover(timeout=30.0, return_adv=True),
+                            timeout=35)
+                    except asyncio.TimeoutError:
+                        print("[hold] 扫描挂起 (WinRT), 放弃本轮")
+                        break
+                    except Exception as e:
+                        # 设备复位瞬间广播包脏 (0000None): 跳过本轮等干净广播,
+                        # 不触发重量级的蓝牙服务重启
+                        print("[hold] 扫描解析失败 (设备复位中?), 2s 后重扫:", e)
+                        await asyncio.sleep(2)
+                        continue
                     tgt = next((d for d, adv in devices.values()
                                 if _valid_mac(d.address) and (d.name == "VibeDot"
                                     or any(str(vp.SERVICE_UUID).lower() in str(u).lower()
@@ -684,6 +885,7 @@ async def _auto_hold():
                 rx = client.services.get_characteristic(vp.CHAR_RX_UUID)
                 await client.write_gatt_char(rx, b"\x07", response=True)
                 _last_hold_ok = True
+                hub.push_fail_streak = 0      # 设备回连: 恢复正常推送节拍
                 print(f"[hold] 设备常开保持 {hub.last_addr}")
             else:
                 _last_hold_ok = False
@@ -703,26 +905,46 @@ async def _auto_hold():
 
 
 async def scheduler():
-    """后台调度: 到期刷屏 + 周期重刷(更新已运行时间) + 空闲回收 + 自动重连守护"""
+    """后台调度: 到期刷屏 + 周期重刷(更新已运行时间) + 空闲回收 + 自动重连守护。
+    节拍规则: 只要有 agent 活跃 (hook 检测到 + 后台有信息) 每 3s 刷一次,
+    直到全部任务结束转懒加载; 事件到期推送失败时 3s 后自动重试而非放弃。"""
     global _last_tick_push, _hold_task
     while True:
         await asyncio.sleep(1)
         hub.reap_idle()
-        if hub.push_eligible_at and time.time() >= hub.push_eligible_at:
-            await do_push()
-            _last_tick_push = time.time()
-        elif (TICK_INTERVAL > 0 and hub.any_active()
-              and time.time() - max(_last_tick_push, hub.last_push) >= TICK_INTERVAL):
-            await do_push()      # agent 运行中: 每 3s 快刷更新时长; 全部结束后懒加载
-            _last_tick_push = time.time()
-        # 连接守护: 失败/无地址每 90s 快重试; 已成功常开则每 300s keepalive
-        if _hold_task is None and time.time() - _last_hold_attempt > (
-                90 if (hub.last_addr is None or not _last_hold_ok) else 300):
+        due_event = hub.push_eligible_at and time.time() >= hub.push_eligible_at
+        # 离线退避: 连续失败时把 tick 间隔指数拉开 (3->6->12->24->30s 封顶),
+        # 避免设备离线期间 3s 一轮空转 (每轮 80-100s 失败周期, pushing 常真
+        # 导致"推送中·排队"徽标常亮、点击排队排不到); 设备回连 (hold 成功)
+        # 即清零恢复正常节拍
+        interval = TICK_INTERVAL if hub.push_fail_streak == 0 else \
+            min(30, TICK_INTERVAL * (2 ** min(hub.push_fail_streak, 4)))
+        due_tick = (TICK_INTERVAL > 0 and hub.any_active()
+                    and time.time() - max(_last_tick_push, hub.last_push) >= interval)
+        # 空闲心跳: 无活跃 agent 时低频刷新 (时钟走字/状态不过夜)
+        due_idle = (IDLE_HEARTBEAT > 0 and not hub.any_active()
+                    and time.time() - max(_last_tick_push, hub.last_push) >= IDLE_HEARTBEAT)
+        if due_event or due_tick or due_idle:
+            r = await do_push()
+            # 只有真正执行了推送才推进节拍; busy/queued 秒回时不推进,
+            # 否则当前推送一结束又要多等 3s (节拍被顺延的根源)
+            if r in ("ok", "fail"):
+                _last_tick_push = time.time()
+            if r == "fail" and hub.push_eligible_at:
+                hub.push_eligible_at = time.time() + interval  # 失败按退避间隔重试
+        # 连接守护: 断连/失败 25s 快重试 (设备 v5 常开持续广播, 连接即回);
+        # 已连接 60s keepalive 写 0x07 续常开; 推送进行中不启动 (守护持锁
+        # 扫描会堵住推送的蓝牙回退)
+        if _hold_task is None and not hub.pushing and time.time() - _last_hold_attempt > (
+                25 if (hub.last_addr is None or not _last_hold_ok) else 60):
             _hold_task = asyncio.create_task(_auto_hold())
 
 
 @app.on_event("startup")
 async def _start():
+    # 启动懒加载首刷: 服务器起来 ~8s 后 (等串口/扫描就绪) 先上屏一帧,
+    # 不必等第一个 hook 事件才有画面
+    hub.push_eligible_at = time.time() + 8
     asyncio.create_task(scheduler())
     asyncio.create_task(_serial_keeper())
 
@@ -743,13 +965,31 @@ async def api_status():
         "counts": hub.counts, "events": list(hub.events)[:30],
         "project": hub.project, "online": hub.last_addr is not None,
         "last_push": hub.last_push, "push_count": hub.push_count,
+        "pushing": hub.pushing,
+        "pending": bool(_pending_push_any or _pending_push_full),
+        "last_result": hub.last_push_result,
+        "device": hub.last_addr,          # 控制台蓝牙管理栏实时显示
     }
 
 
 @app.post("/api/push")
 async def api_push(full: int = 0):
+    """点击推送: 排队后等待真正执行完再返回——前端按钮转圈时间 = 真实推送进度,
+    返回实际路径 (串口优先, 未连接立刻蓝牙) / 耗时 / 成败, 不再'点一下就没下文'"""
     r = await do_push(force_full=bool(full))
-    return {"ok": True, "queued": r == "queued", "preview": "/preview.png"}
+    if r == "queued":
+        # 已排队: 等当前推送 + 排队补推全部落地 (上限 3 分钟, 覆盖最坏
+        # 串口 25s + 蓝牙扫描回退 ~2.5min)
+        deadline = time.time() + 180
+        while time.time() < deadline and (hub.pushing or _pending_push_any
+                                          or _pending_push_full):
+            await asyncio.sleep(0.5)
+    lr = hub.last_push_result or {}
+    ok = bool(lr.get("ok"))
+    return {"ok": ok, "queued": False,
+            "result": "ok" if ok else "fail",
+            "path": lr.get("path"), "dur": lr.get("dur"),
+            "preview": "/preview.png"}
 
 
 @app.get("/preview.png")
@@ -1025,111 +1265,129 @@ async def api_flash_status():
             "port": FLASH_STATE["port"], "log": FLASH_STATE["log"][-80:]}
 
 
+async def _ble_cmd(payload=None, read_status=False, scans=3):
+    """控制台蓝牙命令统一入口:
+    - 全局 _ble_lock 串行 (与推送/守护互斥, 避免并发撞 0x800704C7)
+    - 优先复用常驻连接 (use_cached_services=False, 不吃 WinRT 脏缓存);
+      无连接则扫描等广播窗口后重建 (设备深睡循环下最长 ~75s)
+    - payload=None 表示只连接读状态不写
+    返回 (ok, msg, addr)"""
+    global _persist_device
+    import bleak
+    async with _ble_lock:
+        client = await _ensure_client()
+        if client is None:
+            tgt = None
+            for _ in range(scans):
+                try:
+                    devices = await asyncio.wait_for(
+                        bleak.BleakScanner.discover(timeout=30.0, return_adv=True),
+                        timeout=35)
+                except Exception as e:
+                    print("[ble] 控制台扫描失败 (重试):", e)
+                    await asyncio.sleep(1)
+                    continue
+                tgt = next((d for d, adv in devices.values()
+                            if _valid_mac(d.address) and (d.name == "VibeDot"
+                                or any(str(vp.SERVICE_UUID).lower() in str(u).lower()
+                                       for u in (adv.service_uuids or [])))), None)
+                if tgt:
+                    break
+                await asyncio.sleep(1)
+            if tgt is None:
+                return False, "未发现设备广播 (设备深睡中, 最长 75s 后自动唤醒广播)", hub.last_addr
+            hub.last_addr = str(tgt.address)
+            _persist_device = tgt
+            client = await _ensure_client()
+            if client is None:
+                return False, ("已发现设备但连接失败 (WinRT 缓存脏/设备弹跳, "
+                               "服务器会自动清理恢复, 稍等 1-2 分钟再试)"), hub.last_addr
+        try:
+            extra = ""
+            if payload is not None:
+                rx = client.services.get_characteristic(vp.CHAR_RX_UUID)
+                await client.write_gatt_char(rx, payload, response=True)
+            if read_status:
+                st = await client.read_gatt_char(vp.CHAR_STATUS_UUID)
+                extra = f", 状态特征: {list(st)}"
+            return True, f"{hub.last_addr}{extra}", hub.last_addr
+        except Exception as e:
+            # 弹跳后残缺 GATT 表 (特征 not found) 等: 丢弃连接重建一次再试
+            _drop_client()
+            try:
+                client2 = await _ensure_client()
+                if client2 is None:
+                    return False, f"发送失败: {e}", hub.last_addr
+                if payload is not None:
+                    rx = client2.services.get_characteristic(vp.CHAR_RX_UUID)
+                    await client2.write_gatt_char(rx, payload, response=True)
+                extra = ""
+                if read_status:
+                    st = await client2.read_gatt_char(vp.CHAR_STATUS_UUID)
+                    extra = f", 状态特征: {list(st)}"
+                return True, f"{hub.last_addr}{extra} (重连后成功)", hub.last_addr
+            except Exception as e2:
+                _drop_client()
+                return False, f"发送失败: {e2}", hub.last_addr
+
+
 @app.get("/api/ble/scan")
 async def api_ble_scan():
-    """扫描 VibeDot 蓝牙广播"""
+    """扫描 VibeDot 蓝牙广播 (走全局锁, 与推送/守护串行)"""
     import bleak
     try:
-        devices = await bleak.BleakScanner.discover(timeout=6.0, return_adv=True)
-        found = []
-        for d, adv in devices.values():
-            if _valid_mac(d.address) and (d.name == "VibeDot" or any(
-                    str(vp.SERVICE_UUID).lower() in str(u).lower()
-                    for u in (adv.service_uuids or []))):
-                found.append({"address": str(d.address), "name": d.name or "VibeDot",
-                              "rssi": adv.rssi})
-        if found:
-            hub.last_addr = found[0]["address"]
-        return {"found": found, "msg": f"发现 {len(found)} 台" if found else "未发现 (设备可能在深度睡眠, 最长 75s 后广播)"}
+        async with _ble_lock:
+            devices = await asyncio.wait_for(
+                bleak.BleakScanner.discover(timeout=6.0, return_adv=True), timeout=10)
     except Exception as e:
         return {"found": [], "msg": f"扫描失败: {e}"}
+    found = []
+    for d, adv in devices.values():
+        if _valid_mac(d.address) and (d.name == "VibeDot" or any(
+                str(vp.SERVICE_UUID).lower() in str(u).lower()
+                for u in (adv.service_uuids or []))):
+            found.append({"address": str(d.address), "name": d.name or "VibeDot",
+                          "rssi": adv.rssi})
+    if found:
+        hub.last_addr = found[0]["address"]
+    return {"found": found,
+            "msg": f"发现 {len(found)} 台" if found else "未发现 (设备深睡中, 最长 75s 后广播)"}
 
 
 @app.post("/api/ble/test")
 async def api_ble_test():
-    """连接设备并读状态特征"""
-    import bleak
-    addr = hub.last_addr
-    if not addr:
-        r = await api_ble_scan()
-        if not r["found"]:
-            return {"ok": False, "msg": r["msg"]}
-        addr = hub.last_addr
-    try:
-        async with bleak.BleakClient(addr) as client:
-            st = await client.read_gatt_char(vp.CHAR_STATUS_UUID)
-            return {"ok": True, "msg": f"已连接 {addr}, 状态特征: {list(st)}",
-                    "address": addr}
-    except Exception as e:
-        hub.last_addr = None
-        return {"ok": False, "msg": f"连接失败: {e}"}
+    """连接设备并读状态特征 (常驻连接复用, 不再裸连地址踩 WinRT not found)"""
+    ok, msg, addr = await _ble_cmd(read_status=True)
+    return {"ok": ok, "msg": f"已连接 {msg}" if ok else msg, "address": addr}
 
 
 @app.post("/api/ble/sleep")
 async def api_ble_sleep():
     """面板睡眠 (0x05): 屏幕断电省电, 设备保持广播;
     面板深睡后首次推送固件会强制全刷重建 VCOM"""
-    import bleak
-    addr = hub.last_addr
-    if not addr:
-        r = await api_ble_scan()
-        if not r["found"]:
-            return {"ok": False, "msg": r["msg"]}
-        addr = hub.last_addr
-    try:
-        async with bleak.BleakClient(addr, timeout=15.0) as client:
-            rx = client.services.get_characteristic(vp.CHAR_RX_UUID)
-            await client.write_gatt_char(rx, b"\x05", response=True)
-        return {"ok": True, "msg": "面板已睡眠 (下次推送自动唤醒全刷)"}
-    except Exception as e:
-        return {"ok": False, "msg": f"发送失败: {e}"}
+    ok, msg, addr = await _ble_cmd(b"\x05")
+    return {"ok": ok, "msg": "面板已睡眠 (下次推送自动唤醒全刷)" if ok else msg}
 
 
 @app.post("/api/ble/off")
 async def api_ble_off():
     """远程关闭设备蓝牙: 写 0x06 -> 固件立即面板睡眠 + 深度睡眠循环"""
-    import bleak
-    addr = hub.last_addr
-    if not addr:
-        r = await api_ble_scan()
-        if not r["found"]:
-            return {"ok": False, "msg": r["msg"]}
-        addr = hub.last_addr
-    try:
-        async with bleak.BleakClient(addr) as client:
-            rx = client.services.get_characteristic(vp.CHAR_RX_UUID)
-            await client.write_gatt_char(rx, b"\x06", response=True)
+    ok, msg, addr = await _ble_cmd(b"\x06")
+    if ok:
         hub.last_addr = None
+        _drop_client()
         return {"ok": True, "msg": "已发送关闭指令, 设备进入低功耗睡眠 (55s 睡 / 20s 广播)"}
-    except Exception as e:
-        return {"ok": False, "msg": f"发送失败: {e}"}
+    return {"ok": False, "msg": msg}
 
 
 @app.post("/api/ble/on")
 async def api_ble_on():
     """开启蓝牙并常开: 扫描等待设备广播窗口 (睡眠循环下最长 ~75s),
     连上后写 0x07 退出睡眠循环保持持续广播, 电脑随时可搜"""
-    import bleak
-    for i in range(4):
-        devices = await bleak.BleakScanner.discover(timeout=30.0, return_adv=True)
-        # return_adv=True: {addr_str: (BLEDevice, AdvertisementData)}
-        tgt = next((d for d, adv in devices.values()
-                    if _valid_mac(d.address) and (d.name == "VibeDot"
-                        or any(str(vp.SERVICE_UUID).lower() in str(u).lower()
-                               for u in (adv.service_uuids or [])))), None)
-        if tgt:
-            hub.last_addr = str(tgt.address)
-            try:
-                async with bleak.BleakClient(tgt.address, timeout=15.0) as client:
-                    rx = client.services.get_characteristic(vp.CHAR_RX_UUID)
-                    await client.write_gatt_char(rx, b"\x07", response=True)  # 常开模式
-                    await client.read_gatt_char(vp.CHAR_STATUS_UUID)
-                return {"ok": True, "msg": f"蓝牙已开启并保持常开 {tgt.address}",
-                        "address": str(tgt.address)}
-            except Exception as e:
-                return {"ok": False, "msg": f"已发现设备但连接失败: {e}"}
-        await asyncio.sleep(1)
-    return {"ok": False, "msg": "扫描 2 分钟未发现设备 (确认已上电, 可重试)"}
+    ok, msg, addr = await _ble_cmd(b"\x07", read_status=True)
+    return {"ok": ok,
+            "msg": f"蓝牙已开启并保持常开 {msg}" if ok else msg,
+            "address": addr}
 
 
 @app.get("/api/ble/device")

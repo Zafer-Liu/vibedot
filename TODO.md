@@ -1,0 +1,25 @@
+# VibeDot 改造任务
+
+- [x] 逆向原厂固件引脚定义 (SPI/DC/RST/BUSY/PWR)
+- [x] 提取 UC8251D 初始化序列与 LUT 波形表
+- [x] 编写 BLE 固件 vibedot.ino
+- [x] 烧录 ESP32-C3 并验证 BLE 广播
+- [x] 水墨屏首次刷新显示成功
+- [x] 调整屏幕方向/极性
+- [x] 定时自动推送 (--loop)
+- [x] 状态服务器: hook 事件状态机 + 防抖推送 (vibedot_server)
+- [x] Web 控制台: 实时状态/事件流/预览/一键接入 hook
+- [x] 多 agent 会话跟踪 (session_id 区分, 并行显示)
+- [x] 水墨屏 UI: agent 列表 + 已运行时间 + git 周图表
+- [x] 局部快速刷新 (partial LUT, 241ms, 0x04 命令) —— 后因 VCOM 依赖默认禁用 (v8)
+- [x] 深度睡眠低功耗 → v5 改为永久常开, 仅网页可关
+- [x] 一键接入: Claude Code/Desktop + Codex Desktop + WorkBuddy + Qoder
+- [x] 开机自启动常驻 (shell:startup VibeDot.vbs)
+- [x] 端口更换 7800 → 8266
+- [x] 白屏根治 (v4 prevValid / v8 定案: 默认全刷模式, 对 VCOM 丢失免疫)
+- [x] 点击推送真实反馈 (排队等待执行, 显示路径/耗时/成败)
+- [x] 15s 活跃节拍 + 10min 空闲心跳 + 失败指数退避
+- [x] 控制台蓝牙管理重写 (常驻连接/全局锁/实时设备状态)
+- [x] 系统蓝牙配对抢占根除 (v7 删除配对能力注册)
+- [ ] 多项目聚合仪表盘
+- [ ] 供电优化 (设备刷新电流尖峰偶发复位: 换稳定电源/加电容)
