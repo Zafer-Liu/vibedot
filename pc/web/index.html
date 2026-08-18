@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VibeDot 控制台</title>
+<style>
+  :root { --bg:#111418; --card:#1a1f26; --line:#2a323c; --fg:#e8ecef; --dim:#8a97a3;
+          --accent:#4da3ff; --ok:#3ecf8e; --warn:#f5b942; --err:#f4645f; --paper:#f2f0e9; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  html, body { height:100%; }
+  body { background:var(--bg); color:var(--fg); font:14px/1.6 "Segoe UI","Microsoft YaHei",sans-serif;
+         padding:20px 24px; overflow:hidden; }
+  h1 { font-size:20px; margin-bottom:4px; }
+  .sub { color:var(--dim); font-size:12px; margin-bottom:14px; }
+  .grid { display:grid; grid-template-columns: 420px 1fr; gap:16px; max-width:1500px;
+          height:calc(100vh - 96px); }
+  .col { display:flex; flex-direction:column; gap:14px; min-height:0; overflow-y:auto; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px 16px; flex:none; }
+  .card h2 { font-size:13px; color:var(--dim); font-weight:600; margin-bottom:10px; text-transform:uppercase; letter-spacing:.05em; }
+  #uptime { font-size:24px; font-weight:700; line-height:1.2; }
+  .pill { display:inline-block; padding:2px 10px; border-radius:99px; font-size:12px; margin:2px 4px 0 0; background:#0003; color:var(--dim); }
+  .agent { display:flex; align-items:center; gap:10px; padding:7px 10px; border:1px solid var(--line);
+           border-radius:8px; margin-bottom:8px; background:#0002; }
+  .badge { display:inline-block; width:10px; height:10px; border-radius:50%; background:var(--dim); flex:none; }
+  .badge.processing { background:var(--warn); animation:pulse 1.2s infinite; }
+  .badge.waiting { background:var(--warn); animation:blink .6s infinite; }
+  .badge.done, .badge.idle { background:var(--ok); }
+  .badge.error { background:var(--err); animation:blink .4s infinite; }
+  @keyframes pulse { 50% { opacity:.4; } }
+  @keyframes blink { 50% { opacity:.1; } }
+  .agent .nm { font-weight:600; width:110px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .agent .st { flex:1; color:var(--dim); font-size:13px; }
+  .agent .dur { font-size:12px; color:var(--dim); font-variant-numeric:tabular-nums; }
+  #preview { width:100%; image-rendering:pixelated; border-radius:6px; background:var(--paper); }
+  button { background:var(--accent); color:#fff; border:0; border-radius:6px; padding:7px 14px;
+           font-size:13px; cursor:pointer; margin:3px 6px 3px 0; display:inline-flex; align-items:center; gap:8px; }
+  button.ghost { background:transparent; border:1px solid var(--line); color:var(--fg); }
+  button.warn { background:var(--err); }
+  button:disabled { opacity:.5; cursor:default; }
+  button .spin { display:none; width:13px; height:13px; border:2px solid #fff5; border-top-color:#fff;
+                 border-radius:50%; animation:rot .7s linear infinite; }
+  button.loading .spin { display:inline-block; }
+  @keyframes rot { to { transform:rotate(360deg); } }
+  .tools .trow { display:flex; align-items:center; gap:8px; padding:6px 0 2px; color:var(--fg); font-size:13px; }
+  .tools .trow input { flex:none; }
+  .tools .tstatus { display:block; padding:0 0 6px 24px; font-size:12px; color:var(--dim); }
+  .tools .st-ok { color:var(--ok); } .tools .st-no { color:var(--dim); }
+  #log { color:var(--dim); font-size:12px; white-space:pre-wrap; margin-top:8px; min-height:18px; }
+  .dev-line { display:flex; align-items:center; gap:8px; margin:6px 0; font-size:13px; color:var(--dim); flex-wrap:wrap; }
+  .dev-line b { color:var(--fg); font-weight:600; }
+  .mono { font-family:Consolas,monospace; }
+  #flashlog { background:#0006; border-radius:6px; padding:8px; margin-top:8px; max-height:150px; overflow-y:auto;
+              font:11px/1.5 Consolas,monospace; color:#9fd0a8; white-space:pre-wrap; display:none; }
+  .ok-t { color:var(--ok); } .err-t { color:var(--err); }
+  /* 右列: 上半管理卡 + 下半事件流 (上下各一半, 内部滚动) */
+  .right { display:flex; flex-direction:column; min-height:0; gap:14px; }
+  .right .manage { flex:1; min-height:0; display:flex; flex-direction:column; gap:14px; overflow-y:auto; padding-right:2px; }
+  .right .manage .card { flex:none; }
+  .evcard { flex:1; min-height:0; display:flex; flex-direction:column; }
+  #events { flex:1; min-height:0; overflow-y:auto; font-size:12px; font-family:Consolas,monospace;
+            padding-right:4px; }
+  #events .row { display:flex; gap:10px; padding:4px 6px; border-bottom:1px solid var(--line); }
+  #events .ts { color:var(--dim); white-space:nowrap; }
+  #events .ag { color:var(--warn); width:70px; white-space:nowrap; }
+  #events .et { color:var(--accent); width:150px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #events::-webkit-scrollbar, .col::-webkit-scrollbar { width:8px; }
+  #events::-webkit-scrollbar-thumb, .col::-webkit-scrollbar-thumb { background:var(--line); border-radius:4px; }
+  @media (max-width:980px){ body{overflow:auto} .grid{ grid-template-columns:1fr; height:auto; }
+    .right{ min-height:600px; } }
+</style>
+</head>
+<body>
+<h1>VibeDot 控制台</h1>
+<div class="sub">多 Agent 状态 → 水墨屏 · 状态更新即蓝牙推送 (快刷) · <span id="srvaddr"></span></div>
+
+<div class="grid">
+  <!-- 左列: 状态 / agent / 预览 / 接入 -->
+  <div class="col">
+    <div class="card">
+      <h2>已运行 / Agents</h2>
+      <div id="uptime">—</div>
+      <div id="counts" style="margin-top:6px"></div>
+    </div>
+
+    <div class="card">
+      <h2>正在运行的 Agent</h2>
+      <div id="agents"><div style="color:var(--dim);font-size:13px">等待事件…</div></div>
+    </div>
+
+    <div class="card">
+      <h2>水墨屏预览</h2>
+      <img id="preview" src="/preview.png" onerror="this.style.opacity=.15">
+      <div>
+        <button id="btn-push" onclick="pushNow()"><span class="spin"></span>推送刷新</button>
+        <button id="btn-pushfull" class="ghost" onclick="pushFull()"><span class="spin"></span>全刷 (清残影)</button>
+      </div>
+    </div>
+
+    <div class="card tools">
+      <h2>一键接入 AI 工具 (原生 Hooks)</h2>
+      <div class="trow"><input type="checkbox" id="t-claude_user" checked>
+        Claude Code / Claude Desktop</div>
+      <span class="tstatus st-no" id="s-claude_user"></span>
+      <div class="trow"><input type="checkbox" id="t-claude_project">
+        Claude Code（当前项目）</div>
+      <span class="tstatus st-no" id="s-claude_project"></span>
+      <div class="trow"><input type="checkbox" id="t-codex_desktop" checked>
+        Codex CLI / Codex Desktop（notify）</div>
+      <span class="tstatus st-no" id="s-codex_desktop"></span>
+      <div class="trow"><input type="checkbox" id="t-workbuddy" checked>
+        WorkBuddy（hooks）</div>
+      <span class="tstatus st-no" id="s-workbuddy"></span>
+      <div class="trow"><input type="checkbox" id="t-qoder" checked>
+        Qoder（hooks）</div>
+      <span class="tstatus st-no" id="s-qoder"></span>
+      <div>
+        <button id="btn-setup" onclick="setupAll()"><span class="spin"></span>setup all — 接入勾选项</button>
+        <button class="ghost" onclick="refreshHookStatus()">检测</button>
+      </div>
+      <div id="log"></div>
+    </div>
+  </div>
+
+  <!-- 右列: 上半 设备管理+蓝牙管理+自启动 / 下半 事件流 (均分) -->
+  <div class="right">
+    <div class="manage">
+      <div class="card">
+        <h2>设备管理</h2>
+        <div class="dev-line">串口: <span id="ports" class="mono">未检测</span>
+          <button id="btn-ports" class="ghost" onclick="scanPorts()"><span class="spin"></span>检测端口</button></div>
+        <div class="dev-line">固件: <select id="flash-port" class="mono" style="background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:4px;padding:4px"></select>
+          <button id="btn-flash" onclick="doFlash()"><span class="spin"></span>一键烧录</button></div>
+        <div id="flashlog"></div>
+      </div>
+
+      <div class="card">
+        <h2>蓝牙管理</h2>
+        <div class="dev-line">设备: <span id="ble-dev" class="mono">—</span>
+          <button id="btn-bleon" onclick="bleOn()"><span class="spin"></span>开启蓝牙</button>
+          <button id="btn-bleoff" class="warn" onclick="bleOff()"><span class="spin"></span>关闭蓝牙</button></div>
+        <div class="dev-line">
+          <button id="btn-blescan" class="ghost" onclick="bleScan()"><span class="spin"></span>扫描</button>
+          <button id="btn-bletest" class="ghost" onclick="bleTest()"><span class="spin"></span>测试连接</button>
+          <span id="ble" class="mono" style="flex:1"></span></div>
+      </div>
+
+      <div class="card">
+        <h2>开机自启动常驻</h2>
+        <div id="as-status" style="color:var(--dim);font-size:13px;margin-bottom:8px"></div>
+        <button id="btn-as" onclick="asInstall()">安装自启动</button>
+        <button class="warn" onclick="asRemove()">移除</button>
+      </div>
+    </div>
+
+    <div class="card evcard">
+      <h2>事件流</h2>
+      <div id="events"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const STATE_LABEL = {idle:'空闲', thinking:'思考中', coding:'编码中', command:'执行命令',
+  searching:'检索中', subagent:'子任务', waiting:'等待确认', done:'完成', error:'出错', conv_end:'对话结束'};
+const GROUP = {thinking:'processing', coding:'processing', command:'processing',
+  searching:'processing', subagent:'processing'};
+
+function fmtDur(s){ s=Math.max(0,Math.floor(s));
+  if(s>=3600) return `${Math.floor(s/3600)}h${String(Math.floor(s%3600/60)).padStart(2,'0')}m`;
+  if(s>=60) return `${Math.floor(s/60)}m${String(s%60).padStart(2,'0')}s`;
+  return `${s}s`; }
+
+async function loading(btn, fn){
+  btn.classList.add('loading'); btn.disabled = true;
+  try { return await fn(); } finally { btn.classList.remove('loading'); btn.disabled = false; }
+}
+
+async function poll(){
+  try{
+    const st = await (await fetch('/api/status')).json();
+    document.getElementById('uptime').textContent = '已运行 ' + fmtDur(st.uptime||0);
+    const c = st.counts || {};
+    document.getElementById('counts').innerHTML =
+      ['turns','coding','command','waiting'].map(k=>`<span class="pill">${
+        {turns:'回合',coding:'编码',command:'命令',waiting:'等待'}[k]} ${c[k]||0}</span>`).join('')
+      + `<span class="pill">刷屏 ${st.push_count||0}</span>`
+      + (st.pushing ? `<span class="pill">⟳ 推送中${st.pending?'·排队':''}…</span>` : '');
+    const ags = st.agents||[];
+    document.getElementById('agents').innerHTML = ags.length ? ags.map(a=>{
+      const g = GROUP[a.state]||a.state;
+      return `<div class="agent"><span class="badge ${g}"></span>` +
+        `<span class="nm">${a.name}</span><span class="st">${a.state_text||STATE_LABEL[a.state]||a.state}</span>` +
+        `<span class="dur">${fmtDur((Date.now()/1000)-a.started)}</span></div>`;
+    }).join('') : '<div style="color:var(--dim);font-size:13px">没有正在运行的 agent</div>';
+    document.getElementById('events').innerHTML = (st.events||[]).map(e=>
+      `<div class="row"><span class="ts">${e.ts}</span><span class="ag">${e.agent||''}</span>` +
+      `<span class="et">${e.type}${e.tool?'·'+e.tool:''}</span></div>`).join('');
+    // 蓝牙设备栏实时状态 (无需点扫描/测试)
+    const bd = document.getElementById('ble-dev');
+    if (bd && !bd.dataset.hold) {
+      bd.textContent = st.device
+        ? (st.online ? `${st.device} ✓ 在线` : `${st.device} 重连中…`)
+        : '未发现 (点"开启蓝牙"或等自动扫描)';
+      bd.className = 'mono ' + (st.device && st.online ? 'ok-t' : '');
+    }
+  }catch(e){}
+}
+setInterval(poll, 2000); poll();
+document.getElementById('srvaddr').textContent = location.host;
+
+/* ---------- 推送 (转圈直到完成) ---------- */
+async function pushNow(){ await doPush('/api/push', 'btn-push'); }
+async function pushFull(){ await doPush('/api/push?full=1', 'btn-pushfull'); }
+async function doPush(url, btnId){
+  const btn = document.getElementById(btnId);
+  await loading(btn, async ()=>{
+    try{
+      const t0 = Date.now();
+      const r = await (await fetch(url, {method:'POST'})).json();
+      const ms = ((Date.now()-t0)/1000).toFixed(1);
+      document.getElementById('preview').src='/preview.png?'+Date.now();
+      log(r.ok ? `已刷新 (${r.path||'?'} ${r.dur||ms}s, 总耗时 ${ms}s)`
+               : `推送失败 (${ms}s, 串口/蓝牙均未成功; 设备掉线时最长需等 ~90s 重连)`);
+    }catch(e){ log('推送失败: '+e); }
+  });
+}
+
+/* ---------- 设备管理 ---------- */
+let flashTimer = null;
+async function scanPorts(){
+  await loading(document.getElementById('btn-ports'), async ()=>{
+    const r = await (await fetch('/api/ports')).json();
+    const el = document.getElementById('ports');
+    const sel = document.getElementById('flash-port');
+    if(!r.ports || !r.ports.length){ el.textContent = '无串口'; sel.innerHTML=''; return; }
+    el.innerHTML = r.ports.map(p =>
+      `${p.port} <span class="ok-t">${p.esp32?'ESP32-C3':''}</span>`).join(' &nbsp; ');
+    sel.innerHTML = r.ports.map(p =>
+      `<option value="${p.port}" ${p.esp32?'selected':''}>${p.port}${p.esp32?' (ESP32)':''} — ${p.desc}</option>`).join('');
+  });
+}
+scanPorts();
+
+async function doFlash(){
+  const port = document.getElementById('flash-port').value;
+  const logEl = document.getElementById('flashlog');
+  logEl.style.display='block'; logEl.textContent = port ? `烧录到 ${port} ...\n` : '自动检测串口 ...\n';
+  const r = await (await fetch('/api/flash', {method:'POST',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify({port})})).json();
+  logEl.textContent += r.msg + '\n';
+  if(!r.ok) return;
+  if(flashTimer) clearInterval(flashTimer);
+  flashTimer = setInterval(async ()=>{
+    const s = await (await fetch('/api/flash/status')).json();
+    logEl.textContent = s.log.join('\n') + '\n';
+    logEl.scrollTop = logEl.scrollHeight;
+    if(!s.running){
+      clearInterval(flashTimer); flashTimer = null;
+      logEl.textContent += s.ok ? '\n✓ 烧录成功' : '\n✗ 烧录失败';
+    }
+  }, 1500);
+}
+
+/* ---------- 蓝牙管理 (开关 / 扫描 / 测试 / 设备状态) ---------- */
+async function bleScan(){
+  const el = document.getElementById('ble');
+  await loading(document.getElementById('btn-blescan'), async ()=>{
+    el.textContent = '扫描中…';
+    const r = await (await fetch('/api/ble/scan')).json();
+    if(r.found && r.found.length){
+      el.innerHTML = r.found.map(f=>`<b>${f.name}</b> ${f.address} (${f.rssi} dBm)`).join('<br>');
+      document.getElementById('ble-dev').textContent = r.found[0].address;
+    } else { el.textContent = r.msg; }
+  });
+}
+
+async function bleTest(){
+  const el = document.getElementById('ble');
+  await loading(document.getElementById('btn-bletest'), async ()=>{
+    const r = await (await fetch('/api/ble/test', {method:'POST'})).json();
+    el.innerHTML = r.ok ? `<span class="ok-t">✓ ${r.msg}</span>` : `<span class="err-t">✗ ${r.msg}</span>`;
+    if(r.address) document.getElementById('ble-dev').textContent = r.address;
+  });
+}
+
+async function bleOn(){
+  const el = document.getElementById('ble');
+  await loading(document.getElementById('btn-bleon'), async ()=>{
+    el.textContent = '等待设备广播窗口…(最长 2 分钟)';
+    const r = await (await fetch('/api/ble/on', {method:'POST'})).json();
+    el.innerHTML = r.ok ? `<span class="ok-t">✓ ${r.msg}</span>` : `<span class="err-t">✗ ${r.msg}</span>`;
+    if(r.address) document.getElementById('ble-dev').textContent = r.address;
+  });
+}
+
+async function bleOff(){
+  const el = document.getElementById('ble');
+  await loading(document.getElementById('btn-bleoff'), async ()=>{
+    const r = await (await fetch('/api/ble/off', {method:'POST'})).json();
+    el.innerHTML = r.ok ? `<span class="ok-t">✓ ${r.msg}</span>` : `<span class="err-t">✗ ${r.msg}</span>`;
+    document.getElementById('ble-dev').textContent = '已关闭 (低功耗睡眠中)';
+  });
+}
+
+/* ---------- 接入 ---------- */
+async function refreshHookStatus(){
+  try{
+    const s = await (await fetch('/api/hook/status')).json();
+    for(const [k,v] of Object.entries(s)){
+      const el = document.getElementById('s-'+k);
+      if(el){ el.textContent = v.installed ? '✓ 已接入' : '未接入'; el.className = v.installed ? 'st-ok' : 'st-no'; }
+    }
+    return s;
+  }catch(e){}
+}
+refreshHookStatus();
+
+async function setupAll(){
+  const tools = [...document.querySelectorAll('.tools input')]
+    .filter(i=>i.checked).map(i=>i.id.slice(2));
+  if(!tools.length){ log('请先勾选要接入的工具'); return; }
+  await loading(document.getElementById('btn-setup'), async ()=>{
+    log('安装中…');
+    const r = await (await fetch('/api/hook/install', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({tool: tools.length===1?tools[0]:'all'})})).json();
+    log(Object.entries(r.results||{}).map(([k,[ok,msg]])=>`${ok?'✓':'✗'} ${k}: ${msg}`).join('\n'));
+    refreshHookStatus();
+  });
+}
+
+/* ---------- 自启动 ---------- */
+async function refreshAutoStart(){
+  try{
+    const s = await (await fetch('/api/autostart/status')).json();
+    const el = document.getElementById('as-status');
+    el.textContent = s.installed ? `✓ 已安装 (端口 ${s.port}) — ${s.path}` : '未安装';
+    el.style.color = s.installed ? 'var(--ok)' : 'var(--dim)';
+  }catch(e){}
+}
+refreshAutoStart();
+
+async function asInstall(){
+  await loading(document.getElementById('btn-as'), async ()=>{
+    const r = await (await fetch('/api/autostart/install', {method:'POST'})).json();
+    log((r.ok?'✓ ':'✗ ')+(r.msg||'')); refreshAutoStart();
+  });
+}
+async function asRemove(){
+  const r = await (await fetch('/api/autostart/uninstall', {method:'POST'})).json();
+  log((r.ok?'✓ ':'✗ ')+(r.msg||'')); refreshAutoStart();
+}
+
+function log(s){ document.getElementById('log').textContent = s; }
+</script>
+</body>
+</html>

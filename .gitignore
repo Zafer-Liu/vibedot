@@ -5,10 +5,23 @@ __pycache__/
 # IDE / Agent 本地配置
 .claude/
 
-# 本地构建产物与静态资源
-web/
+# 本地构建产物 (Arduino build 目录; 仓库只发布 firmware/ 预编译 bin)
 build/
+
+# 逆向工程产物 (本地分析用, 不入库)
+reverse/
+*.asm
+flash_dump.bin
+irom.bin
+boot_log.bin
+drv.asm
+lowlevel.asm
+epd_func.asm
 
 # 日志与临时文件
 *.log
 *.tmp
+server.log
+
+# 运行时生成 (每次推送覆盖)
+pc/web/preview.png
