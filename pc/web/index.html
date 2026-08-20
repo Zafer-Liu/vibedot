@@ -208,8 +208,10 @@ async function poll(){
     // 蓝牙设备栏实时状态 (无需点扫描/测试)
     const bd = document.getElementById('ble-dev');
     if (bd && !bd.dataset.hold) {
+      const batt = (st.battery !== null && st.battery !== undefined)
+        ? ` · 电量 ${st.battery}%` : '';
       bd.textContent = st.device
-        ? (st.online ? `${st.device} ✓ 在线` : `${st.device} 重连中…`)
+        ? (st.online ? `${st.device} ✓ 在线${batt}` : `${st.device} 重连中…${batt}`)
         : '未发现 (点"开启蓝牙"或等自动扫描)';
       bd.className = 'mono ' + (st.device && st.online ? 'ok-t' : '');
     }

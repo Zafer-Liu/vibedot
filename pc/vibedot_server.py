@@ -17,6 +17,7 @@ import asyncio
 import datetime
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -114,6 +115,8 @@ class Hub:
         self.pushing = False
         self.last_push_result = None          # 最近一次推送结果 {ok,path,dur,ts}
         self.push_fail_streak = 0             # 连续推送失败次数 (离线退避用)
+        self.battery = None                   # 设备电量% (状态特征第 4 字节/串口 [BATT])
+        self.battery_ts = 0.0                 # 电量最近更新时间
 
     # ---- 事件分类 (hook 事件或直接状态; Claude Code / Qoder / WorkBuddy 同构) ----
     # 注: 不采集具体执行内容 (命令/文件/prompt), 只用状态与工具名
@@ -325,10 +328,13 @@ def render_state():
         d.text((vp.EPD_W - 6 - tw, y + 1), dur, font=f_small, fill=0)
         y += 24
 
-    # ---- 底部: 已运行时间 (右对齐) ----
+    # ---- 底部: 电量 + 已运行时间 ----
     uptime = fmt_dur(time.time() - hub.started)
     d.line([(0, vp.EPD_H - 22), (vp.EPD_W, vp.EPD_H - 22)], fill=0, width=1)
-    d.text((6, vp.EPD_H - 18), "vibedot", font=f_small, fill=0)
+    left = "vibedot"
+    if hub.battery is not None:
+        left += f" · 电量 {hub.battery}%"   # 固件 v9 状态特征/串口上报
+    d.text((6, vp.EPD_H - 18), left, font=f_small, fill=0)
     tw = d.textlength(f"已运行 {uptime}", font=f_small)
     d.text((vp.EPD_W - 6 - tw, vp.EPD_H - 18), f"已运行 {uptime}", font=f_small, fill=0)
     return img
@@ -452,6 +458,13 @@ def _serial_keeper_tick(heartbeat: bool):
                 line = line.strip()
                 if line:
                     print("[dev]", line)
+                    # 固件 v9 电量上报: "[BATT] ... 3950 mV -> 75%" 或
+                    # "[BATT] CH0 (直连): 3950 mV -> 75%" (USB 直连时 BLE 未连也有电量)
+                    if line.startswith("[BATT]"):
+                        m = re.search(r"-> (\d+)%", line)
+                        if m:
+                            hub.battery = int(m.group(1))
+                            hub.battery_ts = time.time()
             if ("BLE advertising" in txt or "[PWR]" in txt
                     or "[SER] always-on" in txt):
                 # setup 完成/设备确认常开: 数据通路已通, 串口立即可推
@@ -793,6 +806,16 @@ async def push_cached(data, fast=False):
         return False
 
 
+def _update_battery(st):
+    """从状态特征提取电量 (固件 v9: 第 4 字节 = 电量%, 0-100)"""
+    try:
+        if st and len(st) >= 4 and 0 <= st[3] <= 100:
+            hub.battery = st[3]
+            hub.battery_ts = time.time()
+    except Exception:
+        pass
+
+
 async def _write_frame(client, data, fast=False):
     import bleak
     mtu = 247
@@ -818,6 +841,7 @@ async def _write_frame(client, data, fast=False):
             except Exception:
                 continue
             if st and st[0] == 1:
+                _update_battery(st)
                 # 保持常开: 每次连上都写 0x07, 设备不会 20s 后又入睡
                 # (电脑开机自动重连后也无需碰设备/串口)
                 try:
@@ -827,6 +851,7 @@ async def _write_frame(client, data, fast=False):
                 print(f"[push] 已刷新 ({'快' if fast else '全'}, 第 {attempt + 1} 轮)")
                 return
             if st and st[0] == 0:
+                _update_battery(st)
                 break
     print("[push] 状态未确认")
 
@@ -1080,6 +1105,7 @@ async def api_status():
         "pending": bool(_pending_push_any or _pending_push_full),
         "last_result": hub.last_push_result,
         "device": hub.last_addr,          # 控制台蓝牙管理栏实时显示
+        "battery": hub.battery,           # 设备电量% (固件 v9), None = 未知
     }
 
 
@@ -1465,6 +1491,7 @@ async def _ble_cmd(payload=None, read_status=False, scans=3):
                 await client.write_gatt_char(rx, payload, response=True)
             if read_status:
                 st = await client.read_gatt_char(vp.CHAR_STATUS_UUID)
+                _update_battery(st)
                 extra = f", 状态特征: {list(st)}"
             return True, f"{hub.last_addr}{extra}", hub.last_addr
         except Exception as e:
@@ -1480,6 +1507,7 @@ async def _ble_cmd(payload=None, read_status=False, scans=3):
                 extra = ""
                 if read_status:
                     st = await client2.read_gatt_char(vp.CHAR_STATUS_UUID)
+                    _update_battery(st)
                     extra = f", 状态特征: {list(st)}"
                 return True, f"{hub.last_addr}{extra} (重连后成功)", hub.last_addr
             except Exception as e2:

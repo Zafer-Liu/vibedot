@@ -1,6 +1,10 @@
 /*
- * VibeDot — 思维重置 Quote/0 水墨屏改造固件 v2
+ * VibeDot — 思维重置 Quote/0 水墨屏改造固件 v9
  * 硬件: ESP32-C3 + UC8251D 2.9" 黑白电子纸 (296x152)
+ *
+ * v9: 电池电量检测 (ADC1 CH0-2 多通道探测, 状态特征第 4 字节带出电量);
+ *     广播自愈 (看门狗式每 10s 重启广播 + 断连即重播, 排查"蓝牙自动关");
+ *     启动打印复位原因 (brownout/panic 等意外掉电可见)
  *
  * 所有引脚 / 初始化序列 / LUT 波形表均逆向自原厂固件
  * (flash dump ota_0@0x10000, 驱动代码 0x42015f00-0x42016600)
@@ -28,6 +32,7 @@
 #include <SPI.h>
 #include <esp_sleep.h>
 #include <esp_system.h>
+#include <driver/adc.h>
 #include "lut.h"
 
 // ============ 引脚 (逆向确认: SPI bus/dev config + gpio 0x100070 三路验证) ============
@@ -77,6 +82,96 @@ volatile bool needDeepSleep = false;
 volatile uint32_t lastActivityMs = 0;
 volatile uint32_t serLastRxMs = 0;         // 最近一次串口数据到达 (主机心跳/推送): USB 链路存活的可靠判据
 bool wokeFromTimer = false;              // 定时唤醒 (非上电): 跳过自检, 窗口内无人连则继续睡
+volatile bool advActive = true;          // 广播是否进行中 (仅深睡前手动清零)
+
+// ============ 电池采样 (v9) ============
+// 原厂固件有电池检测 (逆向: [BATTERY]/VBUS/adc_oneshot 字符串) 但采样代码
+// 不在此固件变体, 电池 ADC 引脚未知。已用引脚 3/4/5/6/7/10/20, 空闲 ADC1
+// 通道仅 CH0-2 (GPIO0/1/2): 三路全采, 取落在合理锂电范围的通道。
+// 支持分压 (读数 1.4-2.3V 视为二分频), 串口打印全部读数供标定
+static int     battChannel = -1;         // 命中的 ADC1 通道, -1 = 未识别
+static int     battDivider = 1;          // 分压倍数
+static uint8_t batt_pct    = 100;        // 对外电量 (状态特征第 4 字节)
+
+// 锂电电压 -> 百分比 (空载近似, 4.2V 满 / 3.3V 空)
+static uint8_t batt_mv_to_pct(uint32_t mv) {
+  if (mv >= 4150) return 100;
+  if (mv >= 4000) return 90;
+  if (mv >= 3900) return 75;
+  if (mv >= 3800) return 60;
+  if (mv >= 3700) return 40;
+  if (mv >= 3600) return 20;
+  if (mv >= 3500) return 10;
+  if (mv >= 3300) return 5;
+  return 0;
+}
+
+static uint32_t batt_read_mv(uint8_t ch) {
+  uint32_t raw = 0;
+  for (int i = 0; i < 16; i++) raw += adc1_get_raw((adc1_channel_t)ch);
+  raw >>= 4;
+  return (uint32_t)(raw * 3100 / 4095);   // 12bit; atten 12dB 官方量程 150-2450mV,
+                                          // 实测非线性可读到 ~3.1V, 超出部分限幅
+}
+
+// 探测三路空闲 ADC, 识别电池通道 (直连 2.8-4.3V 或二分频 1.4-2.3V)
+static void batt_probe() {
+  adc1_config_width(ADC_WIDTH_BIT_12);
+  adc1_config_channel_atten(ADC1_CHANNEL_0, ADC_ATTEN_DB_12);
+  adc1_config_channel_atten(ADC1_CHANNEL_1, ADC_ATTEN_DB_12);
+  adc1_config_channel_atten(ADC1_CHANNEL_2, ADC_ATTEN_DB_12);
+  uint32_t mv[3];
+  for (int ch = 0; ch < 3; ch++) {
+    mv[ch] = batt_read_mv(ch);
+    Serial.printf("[BATT] ADC1_CH%d (GPIO%d): %lu mV\n", ch, ch, (unsigned long)mv[ch]);
+  }
+  battChannel = -1; battDivider = 1;
+  // 优先分压范围 (真实信号稳定); 接近饱和 (~3100mV) 的读数多为悬空引脚,
+  // 仅当无分压通道时才当作直连电池候选
+  int directCh = -1;
+  for (int ch = 0; ch < 3; ch++) {
+    if (mv[ch] >= 1400 && mv[ch] <= 2300) {
+      battChannel = ch; battDivider = 2; break;
+    }
+    if (mv[ch] >= 2800 && mv[ch] <= 3000 && directCh < 0) directCh = ch;
+  }
+  if (battChannel < 0 && directCh >= 0) { battChannel = directCh; battDivider = 1; }
+  if (battChannel >= 0) {
+    uint32_t v = mv[battChannel] * battDivider;
+    batt_pct = batt_mv_to_pct(v);
+    Serial.printf("[BATT] CH%d %s: %lu mV -> %u%%\n", battChannel,
+                  battDivider == 2 ? "(x2 分压)" : "(直连)",
+                  (unsigned long)v, batt_pct);
+  } else {
+    batt_pct = 100;   // 未接电池/未识别: 视为 USB 供电满电
+    Serial.println("[BATT] 未识别电池通道 (USB 供电?), 电量按 100% 上报");
+    Serial.println("[BATT] 提示: 若蓝牙曾莫名消失, 留意启动横幅 reset 是否为 BROWNOUT");
+  }
+}
+
+static void batt_update() {
+  if (battChannel < 0) return;
+  uint32_t v = batt_read_mv(battChannel) * battDivider;
+  batt_pct = batt_mv_to_pct(v);
+  Serial.printf("[BATT] %lu mV -> %u%%\n", (unsigned long)v, batt_pct);
+}
+
+// 复位原因 (排查"蓝牙莫名关闭": brownout=欠压掉电, PANIC=固件崩溃...)
+static const char* reset_reason_str() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:   return "power-on";
+    case ESP_RST_EXT:       return "external";
+    case ESP_RST_SW:        return "software";
+    case ESP_RST_PANIC:     return "PANIC(异常/断言)";
+    case ESP_RST_INT_WDT:   return "中断看门狗";
+    case ESP_RST_TASK_WDT:  return "任务看门狗";
+    case ESP_RST_WDT:       return "其他看门狗";
+    case ESP_RST_DEEPSLEEP: return "深睡唤醒";
+    case ESP_RST_BROWNOUT:  return "BROWNOUT(欠压掉电)";
+    case ESP_RST_SDIO:      return "SDIO";
+    default:                return "unknown";
+  }
+}
 
 class ServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer* s) override {
@@ -89,7 +184,10 @@ class ServerCallbacks : public BLEServerCallbacks {
   void onDisconnect(BLEServer* s) override {
     lastActivityMs = millis();
     Serial.printf("[BLE] disconnected (%d)\n", s->getConnectedCount());
-    if (s->getConnectedCount() == 0) s->getAdvertising()->start();
+    if (s->getConnectedCount() == 0) {
+      advActive = true;
+      s->getAdvertising()->start();   // 断连即重新广播 (v9: loop 中另有自愈兜底)
+    }
   }
 };
 
@@ -264,6 +362,7 @@ static void enter_deep_sleep_cycle() {
   epd_power_off();
   panelSlept = true;            // 深睡掉电, 唤醒后首次刷新必须全刷
   BLEDevice::stopAdvertising();
+  advActive = false;
   esp_sleep_enable_timer_wakeup(DEEP_SLEEP_US);
   esp_deep_sleep_start();
 }
@@ -368,8 +467,11 @@ void setup() {
   Serial.begin(115200);
   wokeFromTimer = (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER);
   if (wokeFromTimer) panelSlept = true;   // 定时唤醒: 面板已掉电, 首次刷新强制全刷
-  Serial.printf("\n[VIBEDOT] v2 boot (%s)\n", wokeFromTimer ? "timer wake" : "power on");
+  Serial.printf("\n[VIBEDOT] v9 boot (%s, reset: %s)\n",
+                wokeFromTimer ? "timer wake" : "power on", reset_reason_str());
   Serial.flush();
+
+  batt_probe();   // 电池采样 (ADC, 不依赖外设)
 
   pinMode(EPD_CS, OUTPUT);  digitalWrite(EPD_CS, HIGH);
   pinMode(EPD_DC, OUTPUT);
@@ -413,6 +515,7 @@ void setup() {
   adv->addServiceUUID(SERVICE_UUID);
   adv->setScanResponse(true);
   BLEDevice::startAdvertising();
+  advActive = true;
   lastActivityMs = millis();
   Serial.println("[VIBEDOT] BLE advertising as 'VibeDot'");
 }
@@ -437,14 +540,14 @@ void loop() {
       prevValid = true;
       panelSlept = false;
       frame_received = 0;
-      uint8_t st[4] = {1, 0, 0, 100};   // state=1 完成
+      uint8_t st[4] = {1, 0, 0, batt_pct};   // state=1 完成; 第 4 字节 = 电量%
       pStatusChar->setValue(st, 4);
       pStatusChar->notify();
     } else {
       // 帧不完整: 通知 PC 当前接收量, 由 PC 重发整帧
       Serial.printf("[VIBEDOT] incomplete frame: %lu/%d\n",
                     (unsigned long)frame_received, FRAME_SZ);
-      uint8_t st[4] = {0, (uint8_t)(frame_received >> 8), (uint8_t)(frame_received & 0xFF), 0};
+      uint8_t st[4] = {0, (uint8_t)(frame_received >> 8), (uint8_t)(frame_received & 0xFF), batt_pct};
       pStatusChar->setValue(st, 4);
       pStatusChar->notify();
     }
@@ -459,6 +562,23 @@ void loop() {
     Serial.println("[VIBEDOT] deep sleep (remote off)");
     epd_panel_sleep();
     enter_deep_sleep_cycle();
+  }
+
+  // ---- 广播自愈 (v9): 兜底任何意外停播 (协议栈异常/被抢占/默认广播超时) ----
+  // NimBLE 库 stopAdvertising 状态无法查询, 用看门狗式重启: 未连接时每 10s
+  // 无条件重启一次广播 (重复 start() 无害); 深睡循环前 advActive 已清零不受影响
+  static uint32_t lastAdvHealMs = 0;
+  if (advActive && pServer->getConnectedCount() == 0 &&
+      millis() - lastAdvHealMs > 10000) {
+    lastAdvHealMs = millis();
+    BLEDevice::startAdvertising();
+  }
+
+  // ---- 电量周期刷新 (30s) ----
+  static uint32_t lastBattMs = 0;
+  if (millis() - lastBattMs > 30000) {
+    lastBattMs = millis();
+    batt_update();
   }
 
   // ---- 低功耗 (v5: 常开) ----
